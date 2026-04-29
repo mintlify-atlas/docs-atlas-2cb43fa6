@@ -1,0 +1,353 @@
+---
+title: "Feedforward Layers: Affine, Norm, Activation"
+description: "Reference for neu's feedforward layers — Affine, BatchNorm, Dropout, ReLU, Sigmoid, Softmax, Embedding, and their loss variants."
+keywords: ["neu", "feedforward", "affine", "relu", "sigmoid", "softmax", "batch normalization", "dropout", "embedding", "deep learning", "go"]
+---
+
+The `layer` package provides a complete set of feedforward building blocks for constructing neural networks in Go with zero external dependencies. Every layer implements the `model.Layer` interface, exposing `Forward`, `Backward`, `Params`, `Grads`, and `SetParams` methods. Learnable parameters are stored as exported `matrix.Matrix` fields so you can initialize, inspect, and save them directly. Stateless layers such as `ReLU`, `Sigmoid`, and `Softmax` hold no parameters and require no initialization beyond instantiation.
+
+---
+
+## layer.Opts
+
+Pass an `Opts` value as a variadic argument to `Forward` to control training-time behaviour such as dropout masks and batch statistics.
+
+<ParamField path="body.Train" type="bool" default="false">
+  When `true`, the layer runs in training mode. `BatchNorm` computes batch statistics and updates running averages; `Dropout` samples and applies a random binary mask.
+</ParamField>
+
+<ParamField path="body.Source" type="randv2.Source">
+  Optional random source (`math/rand/v2`) used by `Dropout` to generate the mask. If `nil`, the layer falls back to a default source.
+</ParamField>
+
+```go
+import (
+    randv2 "math/rand/v2"
+    "github.com/itsubaki/neu/layer"
+)
+
+opts := layer.Opts{Train: true, Source: randv2.NewPCG(42, 0)}
+out := myLayer.Forward(x, nil, opts)
+```
+
+---
+
+## Affine
+
+A fully-connected (dense) layer that computes `y = x·W + B`.
+
+<ParamField path="body.W" type="matrix.Matrix" required>
+  Weight matrix with shape `(D, H)` where `D` is the input dimension and `H` is the output dimension.
+</ParamField>
+
+<ParamField path="body.B" type="matrix.Matrix" required>
+  Bias row vector with shape `(1, H)`.
+</ParamField>
+
+<ParamField path="body.DW" type="matrix.Matrix">
+  Gradient of the loss with respect to `W`. Populated after `Backward`.
+</ParamField>
+
+<ParamField path="body.DB" type="matrix.Matrix">
+  Gradient of the loss with respect to `B`. Populated after `Backward`.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *Affine) Forward(x, _ matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *Affine) Backward(dout matrix.Matrix) (dx, nil matrix.Matrix)
+```
+
+`Forward` accepts the input `x` of shape `(N, D)` and returns `(N, H)`. The second argument is unused (reserved for interface compatibility). `Backward` returns `dx` of shape `(N, D)` and `nil` for the second gradient.
+
+```go
+import (
+    "github.com/itsubaki/neu/layer"
+    "github.com/itsubaki/neu/math/matrix"
+    "github.com/itsubaki/neu/weight"
+)
+
+W := matrix.Randn(128, 64, nil).MulC(weight.He(128))
+B := matrix.Zero(1, 64)
+
+l := &layer.Affine{W: W, B: B}
+out := l.Forward(x, nil) // x shape: (N, 128)
+dx, _ := l.Backward(dout)
+```
+
+---
+
+## BatchNorm
+
+Applies batch normalization: normalizes each feature across the batch, then scales and shifts with learned parameters `Gamma` and `Beta`. Running mean and variance are updated during training and used at inference.
+
+<ParamField path="body.Gamma" type="matrix.Matrix" required>
+  Scale parameter with shape `(1, D)`. Initialized to ones.
+</ParamField>
+
+<ParamField path="body.Beta" type="matrix.Matrix" required>
+  Shift parameter with shape `(1, D)`. Initialized to zeros.
+</ParamField>
+
+<ParamField path="body.Momentum" type="float64" default="0.9">
+  Exponential moving-average coefficient for updating the running mean and variance. A higher value retains more history.
+</ParamField>
+
+<ParamField path="body.DGamma" type="matrix.Matrix">
+  Gradient with respect to `Gamma`. Populated after `Backward`.
+</ParamField>
+
+<ParamField path="body.DBeta" type="matrix.Matrix">
+  Gradient with respect to `Beta`. Populated after `Backward`.
+</ParamField>
+
+<Note>
+  Pass `layer.Opts{Train: true}` during training so the layer computes batch statistics and updates running averages. Without this flag it normalizes using the accumulated running mean and variance.
+</Note>
+
+**Signatures**
+
+```go
+func (l *BatchNorm) Forward(x, _ matrix.Matrix, opts ...Opts) matrix.Matrix
+func (l *BatchNorm) Backward(dout matrix.Matrix) (dx, nil matrix.Matrix)
+```
+
+```go
+D := 64
+l := &layer.BatchNorm{
+    Gamma:    matrix.One(1, D),
+    Beta:     matrix.Zero(1, D),
+    Momentum: 0.9,
+}
+
+trainOpts := layer.Opts{Train: true}
+out := l.Forward(x, nil, trainOpts)
+dx, _ := l.Backward(dout)
+```
+
+---
+
+## Dropout
+
+Randomly zeroes activations during training to reduce overfitting. At inference time, activations are scaled by `(1 - Ratio)` instead.
+
+<ParamField path="body.Ratio" type="float64" required>
+  Fraction of units to drop. A value of `0.5` drops half the activations during training.
+</ParamField>
+
+<Note>
+  The mask is sampled from `opts.Source` when `opts.Train` is `true`. At inference (no opts or `Train: false`) activations are multiplied by `1 - Ratio` without masking.
+</Note>
+
+**Signatures**
+
+```go
+func (l *Dropout) Forward(x, _ matrix.Matrix, opts ...Opts) matrix.Matrix
+func (l *Dropout) Backward(dout matrix.Matrix) (dx, nil matrix.Matrix)
+```
+
+```go
+l := &layer.Dropout{Ratio: 0.5}
+out := l.Forward(x, nil, layer.Opts{Train: true, Source: src})
+```
+
+---
+
+## ReLU
+
+Element-wise rectified linear unit: `f(x) = max(0, x)`. No learnable parameters.
+
+**Signatures**
+
+```go
+func (l *ReLU) Forward(x, _ matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *ReLU) Backward(dout matrix.Matrix) (dx, nil matrix.Matrix)
+```
+
+```go
+l := &layer.ReLU{}
+out := l.Forward(x, nil)
+dx, _ := l.Backward(dout)
+```
+
+---
+
+## Sigmoid
+
+Element-wise logistic sigmoid: `σ(x) = 1 / (1 + exp(-x))`. No learnable parameters.
+
+**Signatures**
+
+```go
+func (l *Sigmoid) Forward(x, _ matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *Sigmoid) Backward(dout matrix.Matrix) (dx, nil matrix.Matrix)
+```
+
+```go
+l := &layer.Sigmoid{}
+out := l.Forward(x, nil)
+```
+
+---
+
+## SigmoidWithLoss
+
+Fuses sigmoid activation and binary cross-entropy loss into a single numerically stable layer. Returns a `(1, 1)` matrix containing the scalar loss.
+
+**Signatures**
+
+```go
+func (l *SigmoidWithLoss) Forward(x, t matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *SigmoidWithLoss) Backward(dout matrix.Matrix) (dx, nil matrix.Matrix)
+```
+
+`x` holds the raw logits, `t` holds the binary targets. The backward pass returns the gradient `(y - t) * dout / N`.
+
+```go
+l := &layer.SigmoidWithLoss{}
+loss := l.Forward(logits, targets)
+dx, _ := l.Backward(matrix.New([]float64{1.0}))
+```
+
+---
+
+## Softmax
+
+Row-wise softmax normalization: converts a matrix of raw scores into a probability distribution over classes. No learnable parameters.
+
+**Signatures**
+
+```go
+func (l *Softmax) Forward(x, _ matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *Softmax) Backward(dout matrix.Matrix) (dx, nil matrix.Matrix)
+```
+
+```go
+l := &layer.Softmax{}
+probs := l.Forward(scores, nil)
+```
+
+---
+
+## SoftmaxWithLoss
+
+Fuses row-wise softmax with categorical cross-entropy loss. Returns a `(1, 1)` scalar loss matrix. This is the standard final layer for multi-class classification.
+
+**Signatures**
+
+```go
+func (l *SoftmaxWithLoss) Forward(x, t matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *SoftmaxWithLoss) Backward(dout matrix.Matrix) (dx, nil matrix.Matrix)
+```
+
+`x` holds raw logits of shape `(N, C)`, `t` holds one-hot targets of the same shape. The backward pass returns `(y - t) * dout / N`.
+
+```go
+l := &layer.SoftmaxWithLoss{}
+loss := l.Forward(logits, oneHotTargets)
+dx, _ := l.Backward(matrix.New([]float64{1.0}))
+```
+
+---
+
+## Embedding
+
+Looks up rows in a weight matrix `W` by integer index, implementing a standard word or token embedding table.
+
+<ParamField path="body.W" type="matrix.Matrix" required>
+  Embedding matrix of shape `(V, D)` where `V` is vocabulary size and `D` is embedding dimension.
+</ParamField>
+
+<ParamField path="body.DW" type="matrix.Matrix">
+  Gradient accumulation matrix for `W`. Populated after `Backward`.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *Embedding) Forward(idx, _ matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *Embedding) Backward(dout matrix.Matrix) (nil, nil matrix.Matrix)
+```
+
+`idx` is an `(N, 1)` matrix of integer token IDs. `Forward` returns the corresponding rows from `W` as an `(N, D)` matrix.
+
+```go
+V, D := 10000, 128
+W := matrix.Randn(V, D, nil).MulC(0.01)
+l := &layer.Embedding{W: W}
+
+idx := matrix.New([]float64{3}, []float64{7}, []float64{42}) // (3, 1)
+out := l.Forward(idx, nil) // (3, 128)
+```
+
+---
+
+## EmbeddingDot
+
+Combines an `Embedding` lookup with a dot-product score against a hidden-state vector. Used inside `NegativeSamplingLoss`.
+
+<ParamField path="body.Embedding" type="layer.Embedding" required>
+  Inner embedding layer that holds the weight matrix.
+</ParamField>
+
+<ParamField path="body.H" type="matrix.Matrix">
+  Cached hidden-state input from the most recent `Forward` call.
+</ParamField>
+
+<ParamField path="body.W" type="matrix.Matrix">
+  Cached target embeddings from the most recent `Forward` call.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *EmbeddingDot) Forward(h, idx matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *EmbeddingDot) Backward(dout matrix.Matrix) (dh, nil matrix.Matrix)
+```
+
+`h` is the hidden state `(N, H)`, `idx` is the target index `(N, 1)`. Returns per-sample dot-product scores `(N, 1)`.
+
+---
+
+## NegativeSamplingLoss
+
+Efficient word-embedding loss that contrasts a positive target sample against several negatives drawn from a unigram distribution. Constructed via `NewNegativeSamplingLoss`.
+
+<AccordionGroup>
+  <Accordion title="Constructor">
+
+```go
+func NewNegativeSamplingLoss(
+    W          matrix.Matrix,
+    corpus      []int,
+    power       float64,
+    sampleSize  int,
+    s           ...randv2.Source,
+) *NegativeSamplingLoss
+```
+
+`W` is the shared output embedding matrix `(V, H)`. `corpus` is the token-ID sequence used to build the unigram frequency table. `power` is the smoothing exponent applied to unigram counts (typically `0.75`). `sampleSize` is the number of negative samples per positive example. `s` is an optional random source that defaults to a cryptographically seeded source.
+
+  </Accordion>
+  <Accordion title="Forward / Backward">
+
+```go
+func (l *NegativeSamplingLoss) Forward(h, target matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *NegativeSamplingLoss) Backward(dout matrix.Matrix) (dh, nil matrix.Matrix)
+```
+
+`h` is the hidden-state matrix `(N, H)`, `target` is the positive word-ID column `(N, 1)`. Returns a `(1, 1)` scalar loss.
+
+```go
+nsl := layer.NewNegativeSamplingLoss(W, corpus, 0.75, 5)
+loss := nsl.Forward(h, target)
+dh, _ := nsl.Backward(matrix.New([]float64{1.0}))
+```
+
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+  All feedforward layers satisfy the `model.Layer` interface. Use `model.Save` and `model.Load` to persist and restore `Params()` to disk via gob encoding.
+</Tip>

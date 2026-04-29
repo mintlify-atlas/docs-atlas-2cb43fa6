@@ -1,0 +1,255 @@
+---
+title: "Optimizers: Updating Parameters During Training"
+description: "Explore all four neu optimizers — SGD, Momentum, AdaGrad, and Adam — plus the WeightDecay and GradsClipping hooks that modify gradients before each update."
+---
+
+An optimizer reads the current parameters and their gradients from a model, applies an update rule, and writes the new parameters back. In neu all optimizers satisfy a single `Update` method, so you can swap them without touching any other code.
+
+## The Optimizer interface
+
+The `optimizer.Model` interface defines what a model must expose for an optimizer to work with it:
+
+```go
+type Model interface {
+    Params() [][]matrix.Matrix
+    Grads() [][]matrix.Matrix
+    SetParams(p [][]matrix.Matrix)
+}
+```
+
+Every built-in model in the `model` package satisfies this interface. The optimizer receives `[][]matrix.Matrix` — a two-dimensional slice where the first index selects a layer and the second selects a parameter matrix within that layer (e.g., `W` then `B`).
+
+Hooks are applied to the gradients before the update rule runs:
+
+```go
+type Hook func(params, grads [][]matrix.Matrix) [][]matrix.Matrix
+```
+
+---
+
+## SGD
+
+Stochastic Gradient Descent subtracts a fixed fraction of each gradient from the corresponding parameter:
+
+```
+p = p - lr · g
+```
+
+```go
+type SGD struct {
+    LearningRate float64
+    Hooks        []Hook
+}
+```
+
+<ParamField path="body.LearningRate" type="float64" required>
+  Step size multiplied by each gradient before subtraction. Typical range: `0.01` – `0.1`.
+</ParamField>
+
+<ParamField path="body.Hooks" type="[]Hook">
+  Optional list of hooks applied to gradients before the update. Hooks run in order.
+</ParamField>
+
+```go
+opt := &optimizer.SGD{LearningRate: 0.01}
+opt.Update(m)
+```
+
+SGD is simple and fast but can be slow to converge and sensitive to the learning rate.
+
+---
+
+## Momentum
+
+Momentum SGD accumulates a velocity vector `v` and uses it to dampen oscillations and accelerate convergence along consistent gradient directions:
+
+```
+v = momentum · v - lr · g
+p = p + v
+```
+
+```go
+type Momentum struct {
+    LearningRate float64
+    Momentum     float64
+    Hooks        []Hook
+}
+```
+
+<ParamField path="body.LearningRate" type="float64" required>
+  Step size for the gradient contribution to velocity. Typical value: `0.01`.
+</ParamField>
+
+<ParamField path="body.Momentum" type="float64" required>
+  Fraction of the previous velocity retained at each step. Typical value: `0.9`.
+</ParamField>
+
+<ParamField path="body.Hooks" type="[]Hook">
+  Optional list of hooks applied to gradients before the update.
+</ParamField>
+
+```go
+opt := &optimizer.Momentum{
+    LearningRate: 0.01,
+    Momentum:     0.9,
+}
+opt.Update(m)
+```
+
+The velocity state `v` is allocated lazily on the first call to `Update` and is shaped to match the model's parameter layout.
+
+---
+
+## AdaGrad
+
+AdaGrad adapts the learning rate per-parameter by dividing by the square root of the accumulated sum of squared gradients. Parameters that receive large gradients get smaller effective updates over time:
+
+```
+h = h + g²
+p = p - lr · g / (√h + ε)
+```
+
+```go
+type AdaGrad struct {
+    LearningRate float64
+    Hooks        []Hook
+}
+```
+
+<ParamField path="body.LearningRate" type="float64" required>
+  Global learning rate before per-parameter scaling. Typical value: `0.01`.
+</ParamField>
+
+<ParamField path="body.Hooks" type="[]Hook">
+  Optional list of hooks applied to gradients before the update.
+</ParamField>
+
+```go
+opt := &optimizer.AdaGrad{LearningRate: 0.01}
+opt.Update(m)
+```
+
+<Warning>
+  AdaGrad's accumulated squared gradient sum grows monotonically. For very long training runs the effective learning rate can become vanishingly small. Consider Adam for such scenarios.
+</Warning>
+
+---
+
+## Adam
+
+Adam combines momentum with per-parameter adaptive learning rates. It maintains a first-moment estimate `m` (mean) and a second-moment estimate `v` (uncentered variance), both bias-corrected:
+
+```
+m = m + (1 - β₁)(g - m)
+v = v + (1 - β₂)(g² - v)
+lr_t = α · √(1 - β₂ᵗ) / (1 - β₁ᵗ)
+p = p - lr_t · m / (√v + ε)
+```
+
+```go
+type Adam struct {
+    Alpha        float64
+    Beta1, Beta2 float64
+    Hooks        []Hook
+}
+```
+
+<ParamField path="body.Alpha" type="float64" required>
+  Base learning rate. The paper's suggested default is `0.001`.
+</ParamField>
+
+<ParamField path="body.Beta1" type="float64" required>
+  Exponential decay for the first moment. Suggested default: `0.9`.
+</ParamField>
+
+<ParamField path="body.Beta2" type="float64" required>
+  Exponential decay for the second moment. Suggested default: `0.999`.
+</ParamField>
+
+<ParamField path="body.Hooks" type="[]Hook">
+  Optional list of hooks applied to gradients before the update.
+</ParamField>
+
+```go
+opt := &optimizer.Adam{
+    Alpha: 0.001,
+    Beta1: 0.9,
+    Beta2: 0.999,
+}
+opt.Update(m)
+```
+
+The iteration counter and moment estimates are stored inside the `Adam` struct and updated automatically on each call to `Update`.
+
+<Tip>
+  Adam is a good default choice for most tasks. Use SGD or Momentum when you want finer control over the learning rate schedule.
+</Tip>
+
+---
+
+## Hooks
+
+Hooks transform the gradient tensor before the optimizer's update rule runs. Attach any number of hooks to any optimizer by populating its `Hooks` slice.
+
+### WeightDecay
+
+`hook.WeightDecay` adds an L2 regularization term to each gradient, which penalizes large parameter values:
+
+```
+g = g + λ · p
+```
+
+```go
+import "github.com/itsubaki/neu/optimizer/hook"
+
+opt := &optimizer.SGD{
+    LearningRate: 0.01,
+    Hooks: []optimizer.Hook{
+        hook.WeightDecay(1e-4),
+    },
+}
+```
+
+`WeightDecay` takes `lambda float64` and returns a closure that satisfies `optimizer.Hook`. Larger values of `λ` produce stronger regularization.
+
+### GradsClipping
+
+`hook.GradsClipping` clips the global gradient norm. If the L2 norm of all gradients exceeds `max`, every gradient is scaled down proportionally so the norm equals `max`. If the norm is already below `max` the gradients are returned unchanged.
+
+```
+norm = √(Σ gᵢ²)
+if norm > max: g = g · (max / norm)
+```
+
+```go
+opt := &optimizer.Adam{
+    Alpha: 0.001,
+    Beta1: 0.9,
+    Beta2: 0.999,
+    Hooks: []optimizer.Hook{
+        hook.GradsClipping(5.0),
+    },
+}
+```
+
+<Note>
+  GradsClipping is especially useful when training recurrent networks, where exploding gradients are a common problem. A `max` value between `1.0` and `5.0` is typical.
+</Note>
+
+### Combining hooks
+
+Hooks are applied in order. You can stack both hooks on the same optimizer:
+
+```go
+opt := &optimizer.Adam{
+    Alpha: 0.001,
+    Beta1: 0.9,
+    Beta2: 0.999,
+    Hooks: []optimizer.Hook{
+        hook.WeightDecay(1e-4),
+        hook.GradsClipping(5.0),
+    },
+}
+```
+
+Weight decay runs first, then the clipped result is handed to the update rule.

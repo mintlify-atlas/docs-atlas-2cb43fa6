@@ -1,0 +1,290 @@
+---
+title: "Seq2Seq model API: standard, peeky, and attention"
+description: "API reference for Seq2Seq, PeekySeq2Seq, and AttentionSeq2Seq in neu, with Encoder, Decoder, attention variant documentation, and the Generate method."
+keywords: ["seq2seq", "encoder", "decoder", "attention", "peeky", "neu", "golang"]
+---
+
+neu provides three sequence-to-sequence architectures that share a common interface: a standard encoder-decoder, a peeky decoder variant that broadcasts the encoder context at every decoding step, and an attention-based model that computes a dynamic weighted sum over encoder hidden states. All three satisfy the `trainer.Seq2Seq` interface and are trained with `trainer.Seq2SeqTrainer`.
+
+---
+
+## Shared interface
+
+All seq2seq models expose the same set of methods:
+
+```go
+type Seq2Seq interface {
+    Generate(xs []matrix.Matrix, startID, length int) []int
+    Forward(xs, ts []matrix.Matrix) []matrix.Matrix
+    Backward()
+    Params() [][]matrix.Matrix
+    Grads() [][]matrix.Matrix
+    SetParams(p [][]matrix.Matrix)
+}
+```
+
+### Generate
+
+```go
+func Generate(xs []matrix.Matrix, startID, length int) []int
+```
+
+Runs the encoder on input sequence `xs`, then autoregressively decodes `length` token IDs starting from `startID`. Returns the decoded ID sequence. The internal decoder selects the argmax token at every step (greedy decoding).
+
+---
+
+## Three model variants
+
+<Tabs>
+  <Tab title="Seq2Seq">
+    The standard encoder-decoder model. The encoder reads the input sequence and passes its final hidden state to the decoder as the initial LSTM state.
+
+    ```go
+    type Seq2Seq struct {
+        Encoder *Encoder
+        Decoder *Decoder             // (implements decoder interface)
+        Softmax *layer.TimeSoftmaxWithLoss
+        Source  randv2.Source
+    }
+    ```
+
+    <ParamField path="body.Encoder" type="*Encoder">
+      Reads the input sequence. Wraps `TimeEmbedding` and a non-stateful `TimeLSTM`. Exposes `Forward(xs []matrix.Matrix) matrix.Matrix` — returns the last hidden state `hs[-1]`.
+    </ParamField>
+
+    <ParamField path="body.Decoder" type="*Decoder">
+      Generates the output sequence. Wraps `TimeEmbedding`, a stateful `TimeLSTM`, and `TimeAffine`. Accepts the encoder's final hidden state to initialise its LSTM.
+    </ParamField>
+
+    <ParamField path="body.Softmax" type="*layer.TimeSoftmaxWithLoss">
+      Computes cross-entropy loss over the full decoder output sequence.
+    </ParamField>
+
+    <ParamField path="body.Source" type="randv2.Source">
+      Random source available for layers that require stochasticity.
+    </ParamField>
+
+    ### Constructor
+
+    ```go
+    func NewSeq2Seq(c *RNNLMConfig, s ...randv2.Source) *Seq2Seq
+    ```
+
+    ### Usage
+
+    ```go
+    m := model.NewSeq2Seq(&model.RNNLMConfig{
+        VocabSize:   13,
+        WordVecSize: 16,
+        HiddenSize:  128,
+        WeightInit:  weight.Xavier,
+    })
+    ```
+  </Tab>
+
+  <Tab title="PeekySeq2Seq">
+    A variant of `Seq2Seq` that uses a `PeekyDecoder`. At every decoding step the encoder's final hidden state `h` is concatenated with the embedded input and with the LSTM output before the affine projection, giving the decoder constant access to the full context vector ("peeking" at the encoder summary).
+
+    ```go
+    type PeekySeq2Seq struct {
+        Seq2Seq
+    }
+    ```
+
+    `PeekySeq2Seq` embeds `Seq2Seq` and replaces only the decoder. The `Encoder`, `Softmax`, `Source` fields, and all method signatures are identical.
+
+    ### Constructor
+
+    ```go
+    func NewPeekySeq2Seq(c *RNNLMConfig, s ...randv2.Source) *PeekySeq2Seq
+    ```
+
+    ### Usage
+
+    ```go
+    m := model.NewPeekySeq2Seq(&model.RNNLMConfig{
+        VocabSize:   13,
+        WordVecSize: 16,
+        HiddenSize:  128,
+        WeightInit:  weight.Xavier,
+    })
+    ```
+
+    <Note>
+      `PeekyDecoder` concatenates `h` both with the LSTM input (shape `H+D`) and with the LSTM output before the affine layer (shape `H+H`). Weight matrices are sized accordingly.
+    </Note>
+  </Tab>
+
+  <Tab title="AttentionSeq2Seq">
+    Replaces the fixed context vector with a soft attention mechanism. The encoder returns all hidden states across time (not just the last one). At each decoding step, the decoder computes a weighted sum of those hidden states using learned attention weights, enabling the model to focus on different parts of the input at each output position.
+
+    ```go
+    type AttentionSeq2Seq struct {
+        Encoder *AttentionEncoder
+        Decoder *AttentionDecoder
+        Softmax *layer.TimeSoftmaxWithLoss
+        Source  randv2.Source
+    }
+    ```
+
+    <ParamField path="body.Encoder" type="*AttentionEncoder">
+      Embeds `Encoder` but overrides `Forward` to return all hidden states `hs` (shape `[Time, N, H]`) rather than just the last one. `Backward` accepts `dhs` of the same shape.
+    </ParamField>
+
+    <ParamField path="body.Decoder" type="*AttentionDecoder">
+      Accepts the full `enchs []matrix.Matrix` slice. Adds a `TimeAttention` layer between the LSTM and the affine projection. At each step, `TimeAttention` computes scaled dot-product scores between the decoder hidden state and all encoder hidden states, applies softmax, and returns a context vector.
+    </ParamField>
+
+    <ParamField path="body.Softmax" type="*layer.TimeSoftmaxWithLoss">
+      Computes cross-entropy loss over the full decoder output sequence.
+    </ParamField>
+
+    <ParamField path="body.Source" type="randv2.Source">
+      Random source for stochastic layers.
+    </ParamField>
+
+    ### Constructor
+
+    ```go
+    func NewAttentionSeq2Seq(c *RNNLMConfig, s ...randv2.Source) *AttentionSeq2Seq
+    ```
+
+    ### Usage
+
+    ```go
+    m := model.NewAttentionSeq2Seq(&model.RNNLMConfig{
+        VocabSize:   13,
+        WordVecSize: 16,
+        HiddenSize:  128,
+        WeightInit:  weight.Xavier,
+    })
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Encoder
+
+`Encoder` is the encoder component used by `Seq2Seq` and `PeekySeq2Seq`. It reads a variable-length input sequence and compresses it into a single hidden-state vector.
+
+```go
+type Encoder struct {
+    TimeEmbedding *layer.TimeEmbedding
+    TimeLSTM      *layer.TimeLSTM  // Stateful: false
+    Source        randv2.Source
+}
+```
+
+<ParamField path="body.TimeEmbedding" type="*layer.TimeEmbedding">
+  Maps integer token IDs to dense vectors of shape `(V, D)`. Weights are initialised with scale `1/100`.
+</ParamField>
+
+<ParamField path="body.TimeLSTM" type="*layer.TimeLSTM">
+  Non-stateful LSTM that processes the full embedded sequence in one call. Returns all hidden states; `Forward` exposes only `hs[-1]` to the decoder.
+</ParamField>
+
+### Constructor
+
+```go
+func NewEncoder(c *RNNLMConfig, s ...randv2.Source) *Encoder
+```
+
+### Key methods
+
+```go
+func (m *Encoder) Forward(xs []matrix.Matrix) matrix.Matrix
+func (m *Encoder) Backward(dh matrix.Matrix)
+```
+
+`Forward` returns the final hidden state `hs[-1]` with shape `(N, H)`. `Backward` injects the upstream gradient only at the last time step, propagates it through `TimeLSTM`, then through `TimeEmbedding`.
+
+---
+
+## Decoder
+
+`Decoder` is the decoding component used by `Seq2Seq`. It takes the encoder's hidden state and an input token sequence, then produces vocabulary logits.
+
+```go
+type Decoder struct {
+    TimeEmbedding *layer.TimeEmbedding
+    TimeLSTM      *layer.TimeLSTM  // Stateful: true
+    TimeAffine    *layer.TimeAffine
+    Source        randv2.Source
+}
+```
+
+<ParamField path="body.TimeEmbedding" type="*layer.TimeEmbedding">
+  Embeds decoder input tokens.
+</ParamField>
+
+<ParamField path="body.TimeLSTM" type="*layer.TimeLSTM">
+  Stateful LSTM initialised with the encoder's hidden state via `SetState(h)` at the start of each forward call.
+</ParamField>
+
+<ParamField path="body.TimeAffine" type="*layer.TimeAffine">
+  Projects LSTM outputs to vocabulary logits of shape `(Time, N, V)`.
+</ParamField>
+
+### Key methods
+
+```go
+func (m *Decoder) Forward(xs []matrix.Matrix, h matrix.Matrix) []matrix.Matrix
+func (m *Decoder) Backward(dscore []matrix.Matrix) matrix.Matrix
+func (m *Decoder) Generate(h matrix.Matrix, startID, length int) []int
+```
+
+`Generate` runs greedy decoding: at each step it feeds the previously selected token ID into the network and returns the argmax of the resulting logits.
+
+---
+
+## PeekyDecoder
+
+`PeekyDecoder` embeds `Decoder` and adds the peeky mechanism. It holds the hidden size `H` as an integer field to support gradient splitting during backprop.
+
+```go
+type PeekyDecoder struct {
+    Decoder
+    H int  // Hidden size, set during Forward
+}
+```
+
+The LSTM input weight matrix has shape `(H+D, 4H)` and the affine weight matrix has shape `(H+H, V)` to accommodate the concatenated context vector.
+
+---
+
+## AttentionEncoder
+
+`AttentionEncoder` embeds `Encoder` but overrides `Forward` to return all time steps rather than just the last hidden state, and overrides `Backward` to accept a full gradient tensor `dhs []matrix.Matrix`.
+
+```go
+type AttentionEncoder struct {
+    Encoder
+}
+
+func NewAttentionEncoder(c *RNNLMConfig, s ...randv2.Source) *AttentionEncoder
+```
+
+---
+
+## AttentionDecoder
+
+`AttentionDecoder` adds a `TimeAttention` layer between the LSTM and the affine projection.
+
+```go
+type AttentionDecoder struct {
+    TimeEmbedding *layer.TimeEmbedding
+    TimeLSTM      *layer.TimeLSTM    // Stateful: true
+    TimeAttention *layer.TimeAttention
+    TimeAffine    *layer.TimeAffine  // Weight shape: (2H, V)
+    Source        randv2.Source
+}
+```
+
+<ParamField path="body.TimeAttention" type="*layer.TimeAttention">
+  Computes soft attention weights over all encoder hidden states and returns a context vector of shape `(Time, N, H)` that is concatenated with the decoder LSTM output before the affine projection.
+</ParamField>
+
+<ParamField path="body.TimeAffine" type="*layer.TimeAffine">
+  Projects the concatenated `[context; decoder_hidden]` vector of size `2H` to vocabulary logits. Weight shape is `(2H, V)`.
+</ParamField>

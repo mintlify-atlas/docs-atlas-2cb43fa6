@@ -1,0 +1,295 @@
+---
+title: "Training: Running the Learning Loop in neu"
+description: "How neu's Trainer, RNNLMTrainer, and Seq2SeqTrainer run the training loop, plus accuracy measurement, random batch sampling, and truncated BPTT for sequence models."
+---
+
+Training a model in neu follows a consistent pattern: shuffle the dataset, slice it into mini-batches, run a forward pass to compute the loss, run a backward pass to compute gradients, and call the optimizer to update the parameters. The `trainer` package encapsulates this loop so you can start training with a single call to `Fit`.
+
+## Trainer
+
+`trainer.Trainer` handles feedforward models that implement `trainer.Model` — any model that exposes `Predict`, `Forward`, `Backward`, `Params`, `Grads`, and `SetParams`.
+
+```go
+type Trainer struct {
+    Model     Model
+    Optimizer Optimizer
+}
+
+func New(m Model, o Optimizer) *Trainer
+```
+
+### Input
+
+Pass a `*trainer.Input` to `Fit` to configure the training run:
+
+```go
+type Input struct {
+    Train      matrix.Matrix
+    TrainLabel matrix.Matrix
+    Epochs     int
+    BatchSize  int
+    Verbose    func(epoch, j int, loss float64, m Model)
+}
+```
+
+<ParamField path="body.Train" type="matrix.Matrix" required>
+  Training features. Shape `(N, features)` where `N` is the total number of samples.
+</ParamField>
+
+<ParamField path="body.TrainLabel" type="matrix.Matrix" required>
+  One-hot or integer labels corresponding to each row in `Train`. Shape `(N, classes)` for one-hot encoding.
+</ParamField>
+
+<ParamField path="body.Epochs" type="int" required>
+  Number of full passes over the training set.
+</ParamField>
+
+<ParamField path="body.BatchSize" type="int" required>
+  Number of samples in each mini-batch. Must evenly divide `len(Train)`.
+</ParamField>
+
+<ParamField path="body.Verbose" type="func(epoch, j int, loss float64, m Model)">
+  Called after every batch update. Use it to log loss, compute validation accuracy, or print progress. Pass a no-op function if you need no output.
+</ParamField>
+
+### The training loop
+
+Internally `Fit` runs the following steps each epoch:
+
+1. **Shuffle** — `vector.Shuffle` randomly permutes `Train` and `TrainLabel` together using the provided source (or a fresh cryptographic source if none is given).
+2. **Batch** — `trainer.Range(j, batchSize)` computes `[begin, end)` slice indices for batch `j`.
+3. **Forward** — `m.Forward(xbatch, tbatch)` runs all layers and returns the scalar loss.
+4. **Backward** — `m.Backward()` propagates gradients back through every layer.
+5. **Update** — `o.Update(m)` applies the optimizer's update rule to the parameters.
+6. **Verbose** — the callback is invoked with the current epoch, batch index, and loss value.
+
+```go
+tr := trainer.New(m, opt)
+tr.Fit(&trainer.Input{
+    Train:      xTrain,
+    TrainLabel: tTrain,
+    Epochs:     30,
+    BatchSize:  100,
+    Verbose: func(epoch, j int, loss float64, m trainer.Model) {
+        if j%100 == 0 {
+            fmt.Printf("epoch %d batch %d loss %.4f\n", epoch, j, loss)
+        }
+    },
+})
+```
+
+An optional `randv2.Source` can be passed as a second argument to `Fit` to make the shuffle reproducible:
+
+```go
+src := rand.NewSource(42)
+tr.Fit(&trainer.Input{...}, src)
+```
+
+---
+
+## Accuracy and random sampling
+
+### trainer.Accuracy
+
+`trainer.Accuracy` computes classification accuracy by comparing the argmax of predictions and labels:
+
+```go
+func Accuracy(y, t matrix.Matrix) float64
+```
+
+`y` is the output of `m.Predict(x)` (shape `(N, classes)`). `t` is the one-hot label matrix. The function returns a value between `0` and `1`.
+
+```go
+pred := m.Predict(xTest)
+acc := trainer.Accuracy(pred, tTest)
+fmt.Printf("test accuracy: %.4f\n", acc)
+```
+
+### trainer.Random
+
+`trainer.Random` samples `batchSize` distinct indices from `[0, trainSize)` without replacement:
+
+```go
+func Random(trainSize, batchSize int, s ...randv2.Source) []int
+```
+
+Use this when you want to hand-pick a random mini-batch outside of the full training loop:
+
+```go
+idx := trainer.Random(len(xTrain), 128)
+xbatch := xTrain[idx[0]:idx[0]+1]  // build batch from indices
+```
+
+---
+
+## RNNLMTrainer
+
+Language models over token sequences use `trainer.RNNLMTrainer`. It handles the stateful batching that character- or word-level LMs require: each epoch the full corpus is divided into `BatchSize` parallel streams, and the hidden state is carried across batches within each stream.
+
+```go
+type RNNLMInput struct {
+    Train      []int
+    TrainLabel []int
+    Epochs     int
+    BatchSize  int
+    TimeSize   int
+    Verbose    func(epoch, j int, perplexity float64, m RNNLM)
+}
+```
+
+<ParamField path="body.Train" type="[]int" required>
+  Flat integer slice of token IDs for the training corpus.
+</ParamField>
+
+<ParamField path="body.TrainLabel" type="[]int" required>
+  Token IDs shifted by one position — each element is the next-token target for the corresponding element in `Train`.
+</ParamField>
+
+<ParamField path="body.Epochs" type="int" required>
+  Number of full passes over the corpus.
+</ParamField>
+
+<ParamField path="body.BatchSize" type="int" required>
+  Number of parallel streams. Larger values improve gradient estimates but consume more memory.
+</ParamField>
+
+<ParamField path="body.TimeSize" type="int" required>
+  Number of time steps processed per batch. This is the BPTT truncation length.
+</ParamField>
+
+<ParamField path="body.Verbose" type="func(epoch, j int, perplexity float64, m RNNLM)">
+  Called after each batch. Reports perplexity (`exp(avg_loss)`) instead of raw loss.
+</ParamField>
+
+```go
+tr := trainer.NewRNNLM(m, opt)
+tr.Fit(&trainer.RNNLMInput{
+    Train:      corpus,
+    TrainLabel: corpusShifted,
+    Epochs:     100,
+    BatchSize:  20,
+    TimeSize:   35,
+    Verbose: func(epoch, j int, ppl float64, _ trainer.RNNLM) {
+        fmt.Printf("epoch %d step %d  ppl %.2f\n", epoch, j, ppl)
+    },
+})
+```
+
+`trainer.Perplexity(totalLoss, count)` is also exported if you need to compute perplexity outside the training loop.
+
+---
+
+## Seq2SeqTrainer
+
+`trainer.Seq2SeqTrainer` trains encoder-decoder models (`Seq2Seq`, `PeekySeq2Seq`, `AttentionSeq2Seq`). It shuffles paired input/output sequences each epoch, reverses the input sequence (which empirically improves results), and converts the flat batch matrices into the time-major `[]matrix.Matrix` format that sequence models expect.
+
+```go
+type Seq2SeqInput struct {
+    Train      [][]int
+    TrainLabel [][]int
+    Epochs     int
+    BatchSize  int
+    Verbose    func(epoch, j int, loss float64, m Seq2Seq)
+}
+```
+
+<ParamField path="body.Train" type="[][]int" required>
+  Slice of integer token sequences for the source side. All sequences within a batch must be the same length (pad if necessary).
+</ParamField>
+
+<ParamField path="body.TrainLabel" type="[][]int" required>
+  Slice of target sequences including the start token. The trainer internally splits these into decoder inputs (`ts[:-1]`) and targets (`ts[1:]`).
+</ParamField>
+
+<ParamField path="body.Epochs" type="int" required>
+  Number of passes over the training set.
+</ParamField>
+
+<ParamField path="body.BatchSize" type="int" required>
+  Mini-batch size.
+</ParamField>
+
+<ParamField path="body.Verbose" type="func(epoch, j int, loss float64, m Seq2Seq)">
+  Called after each batch. Reports the running mean loss over the epoch.
+</ParamField>
+
+```go
+tr := trainer.NewSeq2Seq(m, opt)
+tr.Fit(&trainer.Seq2SeqInput{
+    Train:      questions,
+    TrainLabel: answers,
+    Epochs:     50,
+    BatchSize:  128,
+    Verbose: func(epoch, j int, loss float64, _ trainer.Seq2Seq) {
+        if j == 0 {
+            fmt.Printf("epoch %d  loss %.4f\n", epoch, loss)
+        }
+    },
+})
+```
+
+---
+
+## Complete training example
+
+The following example trains a two-hidden-layer MLP on a toy four-class dataset, evaluates accuracy after every epoch, and saves the final checkpoint.
+
+```go
+package main
+
+import (
+    "fmt"
+
+    "github.com/itsubaki/neu/math/matrix"
+    "github.com/itsubaki/neu/math/rand"
+    "github.com/itsubaki/neu/model"
+    "github.com/itsubaki/neu/optimizer"
+    "github.com/itsubaki/neu/trainer"
+    "github.com/itsubaki/neu/weight"
+)
+
+func main() {
+    src := rand.NewSource(rand.MustRead())
+
+    // 200 samples, 4 features, 4 classes (one-hot)
+    xTrain := matrix.Randn(200, 4, src)
+    tTrain := matrix.Zero(200, 4)
+    for i := range 200 {
+        tTrain[i][i%4] = 1
+    }
+
+    m := model.NewMLP(&model.MLPConfig{
+        InputSize:         4,
+        OutputSize:        4,
+        HiddenSize:        []int{64, 32},
+        WeightInit:        weight.He,
+        BatchNormMomentum: 0.9,
+    }, src)
+
+    opt := &optimizer.Adam{Alpha: 0.001, Beta1: 0.9, Beta2: 0.999}
+
+    tr := trainer.New(m, opt)
+    tr.Fit(&trainer.Input{
+        Train:      xTrain,
+        TrainLabel: tTrain,
+        Epochs:     20,
+        BatchSize:  20,
+        Verbose: func(epoch, j int, loss float64, m trainer.Model) {
+            if j == 0 {
+                pred := m.Predict(xTrain)
+                acc := trainer.Accuracy(pred, tTrain)
+                fmt.Printf("epoch %2d  loss %.4f  acc %.4f\n", epoch, loss, acc)
+            }
+        },
+    }, src)
+
+    if err := model.Save("checkpoint.gob", m.Params()); err != nil {
+        panic(err)
+    }
+    fmt.Println("saved checkpoint.gob")
+}
+```
+
+<Note>
+  The same `src` is passed to both `NewMLP` and `Fit`. Passing a shared source is not required — each will create its own if none is provided — but doing so makes the entire run reproducible from a single seed.
+</Note>

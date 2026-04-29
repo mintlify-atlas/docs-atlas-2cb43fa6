@@ -1,0 +1,253 @@
+---
+title: "QNet and DQNAgent API reference for deep Q-learning"
+description: "API reference for QNet, DQNAgent, and ReplayBuffer in neu's RL package. Covers struct fields, GetAction, Update, Sync methods, and a DQN training example."
+keywords: ["qnet", "dqn", "reinforcement learning", "replay buffer", "neu", "golang"]
+---
+
+`QNet` is a feedforward network tailored for deep Q-learning. It uses `MeanSquaredError` as its loss function (in place of `SoftmaxWithLoss`) and adds a `Sync` method to copy parameters between two networks — the canonical target-network update in DQN. The `DQNAgent` wires a `QNet`, a target `QNet`, a `ReplayBuffer`, and an `Adam` optimizer into a ready-to-use agent.
+
+---
+
+## QNet
+
+`QNet` embeds `Sequential` and replaces the final layer with `*layer.MeanSquaredError`.
+
+```go
+type QNet struct {
+    Sequential
+}
+```
+
+### QNetConfig
+
+```go
+type QNetConfig struct {
+    InputSize  int
+    OutputSize int
+    HiddenSize []int
+    WeightInit WeightInit
+}
+```
+
+<ParamField path="body.InputSize" type="int" required>
+  Number of state features fed into the network (e.g., `4` for CartPole observations).
+</ParamField>
+
+<ParamField path="body.OutputSize" type="int" required>
+  Number of discrete actions. The network outputs one Q-value per action.
+</ParamField>
+
+<ParamField path="body.HiddenSize" type="[]int" required>
+  Widths of the hidden layers. Each entry produces an Affine → ReLU block. `[]int{128}` creates a single hidden layer of width 128.
+</ParamField>
+
+<ParamField path="body.WeightInit" type="WeightInit" required>
+  Weight initialiser function. `weight.He` is the standard choice for ReLU networks.
+</ParamField>
+
+### Constructor
+
+```go
+func NewQNet(c *QNetConfig, s ...randv2.Source) *QNet
+```
+
+If no random source is provided, `NewQNet` creates a cryptographically seeded source automatically.
+
+### Methods
+
+`QNet` inherits `Predict`, `Backward`, `Layers`, `Params`, `Grads`, `SetParams`, and `Summary` from `Sequential`. It adds two methods:
+
+#### Loss
+
+```go
+func (m *QNet) Loss(target, q matrix.Matrix) matrix.Matrix
+```
+
+Computes mean-squared error between `target` and `q` by forwarding both matrices through the `MeanSquaredError` layer. Call `Backward` on the model immediately after to compute gradients.
+
+#### Sync
+
+```go
+func (m *QNet) Sync(q *QNet)
+```
+
+Copies all parameters from `q` into the receiver by deep-cloning each matrix. Used to periodically synchronise the target network with the online network in DQN.
+
+---
+
+## DQNAgent
+
+`DQNAgent` implements the standard deep Q-network training loop. It holds an online network `Q`, a target network `QTarget`, a `ReplayBuffer`, and the hyperparameters required for the Bellman update.
+
+```go
+type DQNAgent struct {
+    Gamma        float64
+    Epsilon      float64
+    ReplayBuffer *ReplayBuffer
+    ActionSize   int
+    Q            *model.QNet
+    QTarget      *model.QNet
+    Optimizer    *optimizer.Adam
+    Source       randv2.Source
+}
+```
+
+<ParamField path="body.Gamma" type="float64" required>
+  Discount factor for future rewards. Typical value: `0.98`. Higher values make the agent value long-term returns more.
+</ParamField>
+
+<ParamField path="body.Epsilon" type="float64" required>
+  Probability of choosing a random action instead of the greedy action (epsilon-greedy exploration). Decrease over training.
+</ParamField>
+
+<ParamField path="body.ReplayBuffer" type="*ReplayBuffer" required>
+  Experience replay buffer. `Update` adds a transition to the buffer and samples a batch for training whenever `Len() >= BatchSize`.
+</ParamField>
+
+<ParamField path="body.ActionSize" type="int" required>
+  Number of discrete actions. Used during random action selection in `GetAction`.
+</ParamField>
+
+<ParamField path="body.Q" type="*model.QNet" required>
+  Online network. Updated at every call to `Update`.
+</ParamField>
+
+<ParamField path="body.QTarget" type="*model.QNet" required>
+  Target network. Updated periodically by calling `Sync`. Its parameters are held fixed between syncs to stabilise training.
+</ParamField>
+
+<ParamField path="body.Optimizer" type="*optimizer.Adam" required>
+  Adam optimizer used to update `Q`. Configure `Alpha`, `Beta1`, and `Beta2` before training.
+</ParamField>
+
+<ParamField path="body.Source" type="randv2.Source" required>
+  Random source for epsilon-greedy action selection.
+</ParamField>
+
+### GetAction
+
+```go
+func (a *DQNAgent) GetAction(state []float64) int
+```
+
+With probability `Epsilon` returns a uniformly random action; otherwise runs `Q.Predict` on `state` and returns the argmax action index.
+
+### Update
+
+```go
+func (a *DQNAgent) Update(state []float64, action int, reward float64, next []float64, done bool) matrix.Matrix
+```
+
+Adds the transition `(state, action, reward, next, done)` to the replay buffer. If the buffer holds fewer transitions than `ReplayBuffer.BatchSize`, returns a zero loss matrix without training. Otherwise:
+
+1. Samples a random mini-batch from the buffer.
+2. Computes current Q-values with `Q.Predict`.
+3. Computes next Q-values with `QTarget.Predict` and constructs Bellman targets: `r + Gamma * max(Q_target(next))` (or just `r` when `done` is true).
+4. Runs `Q.Loss(q, target)`, `Q.Backward()`, and `Optimizer.Update(Q)`.
+5. Returns the scalar loss.
+
+### Sync
+
+```go
+func (a *DQNAgent) Sync()
+```
+
+Calls `QTarget.Sync(Q)` to copy the online network weights into the target network.
+
+---
+
+## ReplayBuffer
+
+`ReplayBuffer` is a fixed-capacity circular buffer of environment transitions. When the buffer is full, new entries overwrite the oldest ones (via the internal `Deque`).
+
+```go
+type ReplayBuffer struct {
+    Buffer    *Deque[Buffer]
+    BatchSize int
+    Source    randv2.Source
+}
+```
+
+<ParamField path="body.Buffer" type="*Deque[Buffer]">
+  Fixed-capacity deque storing `Buffer` structs. Each `Buffer` holds one transition: `State`, `Action`, `Reward`, `NextState`, `Done`.
+</ParamField>
+
+<ParamField path="body.BatchSize" type="int" required>
+  Number of transitions to sample per training step. `Update` waits until `Len() >= BatchSize` before starting training.
+</ParamField>
+
+<ParamField path="body.Source" type="randv2.Source">
+  Random source used for reservoir sampling in `Batch`.
+</ParamField>
+
+### Constructor
+
+```go
+func NewReplayBuffer(bufferSize, batchSize int, s ...randv2.Source) *ReplayBuffer
+```
+
+`bufferSize` sets the maximum number of stored transitions. When full, the oldest transition is evicted.
+
+### Methods
+
+```go
+func (b *ReplayBuffer) Add(state []float64, action int, reward float64, next []float64, done bool)
+func (b *ReplayBuffer) Len() int
+func (b *ReplayBuffer) Batch() ([][]float64, []int, []float64, [][]float64, []bool)
+```
+
+`Batch` returns a random sample of `BatchSize` transitions as five parallel slices: states, actions, rewards, next states, and done flags.
+
+---
+
+## Usage example
+
+```go
+import (
+    "github.com/itsubaki/neu/agent"
+    "github.com/itsubaki/neu/model"
+    "github.com/itsubaki/neu/optimizer"
+    "github.com/itsubaki/neu/weight"
+)
+
+qnet := func() *model.QNet {
+    return model.NewQNet(&model.QNetConfig{
+        InputSize:  4,
+        OutputSize: 2,
+        HiddenSize: []int{128},
+        WeightInit: weight.He,
+    })
+}
+
+a := &agent.DQNAgent{
+    Gamma:        0.98,
+    Epsilon:      0.1,
+    ActionSize:   2,
+    Q:            qnet(),
+    QTarget:      qnet(),
+    ReplayBuffer: agent.NewReplayBuffer(10000, 32),
+    Optimizer:    &optimizer.Adam{Alpha: 0.0005, Beta1: 0.9, Beta2: 0.999},
+    Source:       src,
+}
+
+// Training loop
+for episode := range 300 {
+    state := env.Reset()
+    for {
+        action := a.GetAction(state)
+        next, reward, done := env.Step(action)
+        a.Update(state, action, reward, next, done)
+        state = next
+        if done {
+            break
+        }
+    }
+    if episode%10 == 0 {
+        a.Sync() // update target network
+    }
+}
+```
+
+<Tip>
+  Sync the target network every 10–100 episodes rather than every step. Syncing too frequently removes the stabilising effect of the target network.
+</Tip>

@@ -1,0 +1,124 @@
+---
+title: "Weight initialisation API: He, Xavier, Glorot, and Std"
+description: "API reference for neu's weight package: the WeightInit type, He, Xavier/Glorot, and Std initialisers, their formulas, when to use each, and MLPConfig integration."
+keywords: ["weight initialisation", "he", "xavier", "glorot", "std", "neu", "golang"]
+---
+
+Good weight initialisation prevents vanishing and exploding gradients at the start of training. neu's `weight` package provides three standard strategies as named functions, all satisfying the `model.WeightInit` type. Pass any of them directly to `MLPConfig.WeightInit`, `RNNLMConfig.WeightInit`, or `QNetConfig.WeightInit`.
+
+---
+
+## WeightInit type
+
+```go
+type WeightInit func(prevNodeNum int) float64
+```
+
+`WeightInit` is a function that accepts the fan-in (number of connections from the previous layer) and returns a scalar multiplier. Each weight matrix is initialised by drawing from a standard normal distribution and scaling every element by the returned value:
+
+```go
+W = matrix.Randn(rows, cols, src).MulC(c.WeightInit(rows))
+```
+
+All three functions in the `weight` package satisfy this type, as does `weight.Std(scale)`.
+
+---
+
+## weight.He
+
+```go
+func He(prevNodeNum int) float64 { return math.Sqrt(2.0 / float64(prevNodeNum)) }
+```
+
+**Formula:** `√(2 / fan_in)`
+
+Designed for layers followed by ReLU activations. Because ReLU discards the negative half of the distribution, He initialisation uses a factor of 2 in the numerator to preserve variance through each layer. Use `weight.He` with `MLP` (which uses ReLU by default) and `QNet`.
+
+```go
+m := model.NewMLP(&model.MLPConfig{
+    InputSize:  784,
+    OutputSize: 10,
+    HiddenSize: []int{256, 128},
+    WeightInit: weight.He,
+})
+```
+
+---
+
+## weight.Xavier and weight.Glorot
+
+```go
+func Xavier(prevNodeNum int) float64 { return math.Sqrt(1.0 / float64(prevNodeNum)) }
+func Glorot(prevNodeNum int) float64 { return Xavier(prevNodeNum) }
+```
+
+**Formula:** `√(1 / fan_in)`
+
+`Glorot` is an alias for `Xavier`; both are identical at runtime. Designed for symmetric activation functions such as sigmoid and tanh. The fan-out is not included in the formula (a simplified version of the original Glorot uniform initialisation). Use `weight.Xavier` or `weight.Glorot` with RNNLM, Seq2Seq, and other models that use sigmoid or tanh internally.
+
+```go
+m := model.NewRNNLM(&model.RNNLMConfig{
+    VocabSize:   10000,
+    WordVecSize: 100,
+    HiddenSize:  100,
+    WeightInit:  weight.Xavier,
+})
+```
+
+---
+
+## weight.Std
+
+```go
+func Std(std float64) func(_ int) float64 {
+    return func(_ int) float64 { return std }
+}
+```
+
+Returns a constant scale regardless of fan-in. Use this when you need an explicit fixed standard deviation, e.g. `weight.Std(0.01)` for a very small initialisation to keep logits near zero at the start of training.
+
+```go
+m := model.NewMLP(&model.MLPConfig{
+    InputSize:  4,
+    OutputSize: 2,
+    HiddenSize: []int{64},
+    WeightInit: weight.Std(0.01),
+})
+```
+
+---
+
+## Comparison
+
+<AccordionGroup>
+  <Accordion title="He vs Xavier vs Std: quick reference">
+
+    | Initialiser | Formula | Recommended activation | Notes |
+    |-------------|---------|----------------------|-------|
+    | `weight.He` | `√(2 / fan_in)` | ReLU | Default choice for MLP and QNet |
+    | `weight.Xavier` | `√(1 / fan_in)` | Sigmoid, tanh | Use with RNNLM, LSTMLM, Seq2Seq |
+    | `weight.Glorot` | `√(1 / fan_in)` | Sigmoid, tanh | Alias for Xavier |
+    | `weight.Std(s)` | constant `s` | Any | Use when you need full control |
+
+  </Accordion>
+  <Accordion title="Why initialisation matters">
+    If weights are too large at initialisation, activations saturate (sigmoid/tanh) or explode (ReLU), making gradients near-zero or unbounded. If weights are too small, signals shrink with depth and learning stalls. He and Xavier choose scales that keep activation variance roughly equal across layers for their respective activation types.
+  </Accordion>
+  <Accordion title="Custom initialiser">
+    You can write your own `WeightInit` function for any fan-in dependent scheme:
+
+    ```go
+    // Lecun normal: sqrt(1 / fan_in) — equivalent to weight.Xavier
+    lecun := func(prevNodeNum int) float64 {
+        return math.Sqrt(1.0 / float64(prevNodeNum))
+    }
+
+    m := model.NewMLP(&model.MLPConfig{
+        InputSize:  784,
+        OutputSize: 10,
+        HiddenSize: []int{256},
+        WeightInit: lecun,
+    })
+    ```
+  </Accordion>
+</AccordionGroup>

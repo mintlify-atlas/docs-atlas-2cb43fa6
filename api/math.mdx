@@ -1,0 +1,282 @@
+---
+title: "Math Utilities: Matrix, Vector, Rand, and More"
+description: "Reference for neu's zero-dependency math primitives — matrix algebra, random sources, tensors, numerical gradients, activation functions, and loss functions."
+keywords: ["matrix", "vector", "activation", "loss", "gradient", "neu", "deep learning", "Go"]
+---
+
+The `math` sub-packages form the numerical backbone of neu. They operate directly on Go slices and require no external dependencies. You interact with them either explicitly — building and transforming `Matrix` values — or implicitly through the layer and trainer APIs, which delegate to these same primitives under the hood. The activation and loss functions documented at the bottom of this page are standalone scalar or slice functions that you can apply directly in custom forward passes.
+
+<AccordionGroup>
+
+<Accordion title="matrix — 2-D float64 algebra">
+
+`matrix.Matrix` is a type alias for `[][]float64`. Every row is an independent slice, so you can index or slice rows like plain Go. All operations return a new `Matrix`; nothing mutates in place.
+
+**Constructors**
+
+| Function | Description |
+|---|---|
+| `New(v ...[]float64) Matrix` | Wrap existing row slices into a Matrix. |
+| `Zero(m, n int) Matrix` | All-zero m×n matrix. |
+| `One(m, n int) Matrix` | All-one m×n matrix. |
+| `Rand(m, n int, s ...Source) Matrix` | Uniform random values in \[0, 1). |
+| `Randn(m, n int, s ...Source) Matrix` | Normally distributed values (μ=0, σ=1). |
+| `Identity(size int) Matrix` | size×size identity matrix. |
+| `From(x [][]int) Matrix` | Convert `[][]int` to Matrix. |
+| `OneHot(x []int, size int) Matrix` | One-hot encode integer labels into an n×size matrix. |
+
+**Dimension and indexing**
+
+```go
+import "github.com/itsubaki/neu/math/matrix"
+
+m := matrix.New(
+    []float64{1, 2, 3},
+    []float64{4, 5, 6},
+)
+
+rows, cols := m.Dim() // 2, 3
+size       := m.Size() // 6
+
+// Select rows by index (useful for mini-batches)
+batch := matrix.Batch(m, []int{0, 0, 1}) // shape 3×3
+```
+
+**Element-wise arithmetic**
+
+`Add`, `Sub`, `Mul`, and `Div` all support broadcasting: if one operand has a single row or a single column, it is repeated to match the other operand's shape.
+
+```go
+a := matrix.New([]float64{1, 2, 3})
+b := matrix.New([]float64{10, 20, 30})
+
+sum  := a.Add(b)    // [[11 22 33]]
+diff := b.Sub(a)    // [[9 18 27]]
+prod := a.MulC(2.0) // [[2 4 6]]
+sq   := a.Pow2()    // [[1 4 9]]
+```
+
+**Transpose and matrix multiplication**
+
+```go
+w := matrix.Randn(3, 4) // 3×4 weight matrix
+x := matrix.Randn(2, 3) // 2-sample mini-batch
+
+out := matrix.MatMul(x, w) // (2×3) · (3×4) → 2×4
+wT  := w.T()               // 4×3 transpose
+```
+
+**Reductions**
+
+| Method | Returns |
+|---|---|
+| `Argmax() []int` | Column index of maximum per row — use for predicted class labels. |
+| `SumAxis0() []float64` | Column-wise sum (reduces rows). |
+| `SumAxis1() []float64` | Row-wise sum (reduces columns). |
+| `MeanAxis0() []float64` | Column-wise mean. |
+| `Sum() float64` | Scalar sum of all elements. |
+| `Mean() float64` | Scalar mean of all elements. |
+
+```go
+logits := matrix.New(
+    []float64{0.1, 0.9, 0.0},
+    []float64{0.7, 0.2, 0.1},
+)
+
+preds := logits.Argmax() // [1, 0]
+```
+
+**Higher-order helpers**
+
+`F`, `F2`, and `F3` apply a scalar function element-wise across one, two, or three matrices of the same shape. They are used internally to implement all arithmetic methods and are useful when you need a custom element-wise transformation.
+
+```go
+// Clip values to [0, 1]
+clipped := matrix.F(m, func(v float64) float64 {
+    if v < 0 { return 0 }
+    if v > 1 { return 1 }
+    return v
+})
+
+// Fused multiply-add: a*b + c
+fma := matrix.F3(a, b, c, func(x, y, z float64) float64 {
+    return x*y + z
+})
+```
+
+</Accordion>
+
+<Accordion title="vector — 1-D float64 utilities">
+
+The `vector` package provides helpers for plain `[]float64` (and generic) slices that complement the `matrix` package.
+
+**Key functions**
+
+| Function | Signature | Description |
+|---|---|---|
+| `Argmax` | `func Argmax(v []float64) int` | Index of the maximum element. |
+| `MatchCount` | `func MatchCount[T comparable](x, y []T) int` | Count of positions where x and y agree — used to compute accuracy. |
+| `Shuffle` | `func Shuffle[T any](x, t []T, s ...Source) ([]T, []T)` | Jointly shuffle two slices (inputs and targets) in place using a cryptographic seed. |
+| `Cos` | `func Cos(x, y []float64) float64` | Cosine similarity between two vectors. |
+| `Choice` | `func Choice(p []float64, s ...Source) int` | Sample an index from a probability distribution. |
+
+```go
+import "github.com/itsubaki/neu/math/vector"
+
+scores := []float64{0.1, 0.8, 0.1}
+pred   := vector.Argmax(scores) // 1
+
+labels := []int{3, 1, 4, 1, 5}
+preds  := []int{3, 0, 4, 1, 2}
+acc    := vector.MatchCount(preds, labels) // 3
+
+xs, ts := vector.Shuffle(inputs, targets) // random permutation
+```
+
+</Accordion>
+
+<Accordion title="rand — cryptographic random sources">
+
+The `rand` package wraps `crypto/rand` to seed Go's `math/rand/v2` generators. Using a cryptographic seed guarantees that each training run starts from a genuinely independent random state without requiring the caller to manage seeds manually.
+
+| Function | Signature | Description |
+|---|---|---|
+| `MustRead` | `func MustRead() [32]byte` | Read 32 bytes from `crypto/rand`; panic on error. |
+| `NewSource` | `func NewSource(seed [32]byte) rand.Source` | Create a ChaCha8 source from a 32-byte seed. |
+| `Const` | `func Const(seed ...uint64) rand.Source` | Create a deterministic PCG source — useful for reproducible tests. |
+
+```go
+import "github.com/itsubaki/neu/math/rand"
+
+// Non-deterministic source (production use)
+src := rand.NewSource(rand.MustRead())
+
+// Deterministic source (tests and reproducible experiments)
+src = rand.Const(42, 0)
+```
+
+Pass the source to any `matrix` or `vector` function that accepts a variadic `...rand.Source` parameter:
+
+```go
+w := matrix.Randn(128, 64, rand.Const(1, 0))
+```
+
+</Accordion>
+
+<Accordion title="tensor — slice-of-matrix operations">
+
+The `tensor` package extends `matrix` operations to `[]matrix.Matrix` — sequences of matrices used in recurrent and attention layers where the first axis is time.
+
+| Function | Signature | Description |
+|---|---|---|
+| `Zero` | `func Zero(m, n, o int) []matrix.Matrix` | Allocate m matrices each of shape n×o, all zeroed. |
+| `ZeroLike` | `func ZeroLike(x []matrix.Matrix) []matrix.Matrix` | Allocate a zero tensor with the same shape as x. |
+| `Add` | `func Add(x, y []matrix.Matrix) []matrix.Matrix` | Element-wise addition at each time step. |
+| `Mul` | `func Mul(x, y []matrix.Matrix) []matrix.Matrix` | Element-wise multiplication at each time step. |
+| `SumAxis0` | `func SumAxis0(hr []matrix.Matrix) matrix.Matrix` | Sum across the time axis, returning a single matrix. |
+| `Argmax` | `func Argmax(score []matrix.Matrix) int` | Global argmax across all elements in the tensor. |
+
+```go
+import (
+    "github.com/itsubaki/neu/math/matrix"
+    "github.com/itsubaki/neu/math/tensor"
+)
+
+// Accumulate gradients for a 3-step sequence, batch=2, hidden=4
+grad := tensor.Zero(3, 2, 4)
+like := tensor.ZeroLike(grad) // same shape, all zeros
+```
+
+</Accordion>
+
+<Accordion title="numerical — finite-difference gradient">
+
+The `numerical` package computes gradients by finite differences. This is significantly slower than backpropagation, but it is independent of the layer implementation and is the standard tool for **gradient checking** — verifying that your analytic gradients are correct.
+
+| Function | Signature | Description |
+|---|---|---|
+| `Gradient` | `func Gradient(f func(x ...float64) float64, x []float64) []float64` | Central-difference gradient of f at x (h = 1e-4). |
+| `GradientDescent` | `func GradientDescent(f func(...float64) float64, x []float64, lr float64, step int) []float64` | Run numerical gradient descent for `step` iterations. |
+| `Diff` | `func Diff(f func(x float64) float64, x []float64, h float64) []float64` | Single-variable central-difference derivative at each point in x. |
+
+```go
+import "github.com/itsubaki/neu/math/numerical"
+
+// f(x, y) = x² + y²
+f := func(v ...float64) float64 {
+    return v[0]*v[0] + v[1]*v[1]
+}
+
+grad := numerical.Gradient(f, []float64{3.0, 4.0})
+// grad ≈ [6.0, 8.0]
+```
+
+<Note>
+Use `numerical.Gradient` for gradient checking only. For training, use the analytic backward pass implemented in the layer packages — numerical differentiation is O(n) forward passes per gradient and impractical at scale.
+</Note>
+
+</Accordion>
+
+<Accordion title="activation — scalar activation functions">
+
+All activation functions live in `github.com/itsubaki/neu/activation`. They operate on individual `float64` values (or slices for Softmax) and can be composed with `matrix.F` to apply them across a matrix.
+
+| Function | Signature | Description |
+|---|---|---|
+| `ReLU` | `func ReLU(x float64) float64` | max(0, x) |
+| `Sigmoid` | `func Sigmoid(x float64) float64` | 1 / (1 + e^−x) |
+| `Softmax` | `func Softmax(a []float64) []float64` | Numerically stable softmax over a slice. |
+| `Tanh` | `func Tanh(x float64) float64` | math.Tanh(x) |
+| `Step` | `func Step(x float64) float64` | 1 if x > 0, else 0 |
+| `Identity` | `func Identity(v float64) float64` | Pass-through — returns v unchanged. |
+
+```go
+import (
+    "github.com/itsubaki/neu/activation"
+    "github.com/itsubaki/neu/math/matrix"
+)
+
+// Apply ReLU element-wise to a matrix
+z := matrix.New([]float64{-1, 0, 2}, []float64{3, -4, 5})
+a := matrix.F(z, activation.ReLU)
+// a = [[0 0 2] [3 0 5]]
+
+// Softmax over a raw score vector
+scores := []float64{2.0, 1.0, 0.1}
+probs  := activation.Softmax(scores)
+// probs ≈ [0.659, 0.242, 0.099]
+```
+
+</Accordion>
+
+<Accordion title="loss — scalar loss functions">
+
+Loss functions are in `github.com/itsubaki/neu/loss`. They take predicted values and targets as `[]float64` and return a scalar.
+
+| Function | Signature | Description |
+|---|---|---|
+| `CrossEntropyError` | `func CrossEntropyError(y, t []float64) float64` | −Σ t·log(y + 1e-7). Expects y to be a probability distribution. |
+| `CrossEntropyErrorL` | `func CrossEntropyErrorL(y []float64, t int) float64` | Single-label variant: −log(y[t] + 1e-7). More efficient when the target is a class index. |
+| `MeanSquaredError` | `func MeanSquaredError(y, t []float64) float64` | Σ (y−t)² / n |
+| `SumSquaredError` | `func SumSquaredError(y, t []float64) float64` | Σ (y−t)² / 2 |
+
+```go
+import (
+    "github.com/itsubaki/neu/activation"
+    "github.com/itsubaki/neu/loss"
+)
+
+logits := []float64{2.3, 0.5, -1.1}
+probs  := activation.Softmax(logits)
+target := []float64{1, 0, 0} // one-hot: class 0
+
+ce := loss.CrossEntropyError(probs, target)
+// typically a small positive number when prediction is correct
+
+// Label-index form (equivalent, avoids building target slice)
+ce2 := loss.CrossEntropyErrorL(probs, 0)
+```
+
+</Accordion>
+
+</AccordionGroup>

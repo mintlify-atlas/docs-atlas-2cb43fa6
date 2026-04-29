@@ -1,0 +1,272 @@
+---
+title: "Models: Composing and Persisting Neural Networks"
+description: "How neu models work: the trainer.Model interface, building networks with Sequential and MLP, RNNLM and Seq2Seq variants, and persisting weights with model.Save and Load."
+---
+
+A model in neu is a self-contained unit that groups layers, routes data through them in a defined order, and exposes a uniform interface to the trainer and optimizer. All models that can be trained with `trainer.Trainer` satisfy the same `Model` interface, which means you can swap architectures without changing any training code.
+
+## The Model interface
+
+The `trainer.Model` interface defines what a trainable model must provide:
+
+```go
+type Model interface {
+    Predict(x matrix.Matrix, opts ...layer.Opts) matrix.Matrix
+    Forward(x, t matrix.Matrix) matrix.Matrix
+    Backward() matrix.Matrix
+    Params() [][]matrix.Matrix
+    Grads() [][]matrix.Matrix
+    SetParams(p [][]matrix.Matrix)
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Predict vs Forward">
+    `Predict` runs all layers except the final loss layer. Use it at inference time to get class scores or probabilities. `Forward` runs the full network including the loss layer and returns the scalar loss. The distinction lets you reuse the same model for both evaluation and training.
+  </Accordion>
+  <Accordion title="Backward">
+    `Backward` propagates the upstream gradient `[1]` through every layer in reverse order. It must be called immediately after `Forward` because layers cache their intermediate values during the forward pass.
+  </Accordion>
+  <Accordion title="Params and Grads">
+    Both methods return a `[][]matrix.Matrix` — a slice of per-layer parameter slices. The outer index corresponds to a layer; the inner index selects a specific matrix within that layer (e.g., `W` then `B` for Affine). `SetParams` writes a new parameter set back using the same shape.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Sequential
+
+`Sequential` is the foundation of most neu models. It holds an ordered slice of `Layer` values and a random source for layers that need randomness (BatchNorm, Dropout).
+
+```go
+type Sequential struct {
+    Layer  []Layer
+    Source randv2.Source
+}
+```
+
+Create a sequential model directly:
+
+```go
+m := model.NewSequential([]model.Layer{
+    &layer.Affine{W: matrix.Randn(4, 8, src).MulC(weight.He(4)), B: matrix.Zero(1, 8)},
+    &layer.ReLU{},
+    &layer.Affine{W: matrix.Randn(8, 3, src).MulC(weight.He(8)), B: matrix.Zero(1, 3)},
+    &layer.SoftmaxWithLoss{},
+}, src)
+```
+
+`Forward` automatically sets `Train: true` on the `Opts` passed to each layer. `Backward` starts from a gradient of `[1]` and threads it through all layers in reverse. `Predict` skips the last layer (assumed to be the loss layer) and passes the remaining layers the provided opts, allowing you to control train/eval mode explicitly.
+
+---
+
+## MLP
+
+`MLP` is a ready-made multi-layer perceptron built on top of `Sequential`. Its constructor reads from `MLPConfig` and wires together alternating Affine → BatchNorm → ReLU blocks followed by a final Affine → SoftmaxWithLoss.
+
+```go
+type MLPConfig struct {
+    InputSize         int
+    OutputSize        int
+    HiddenSize        []int
+    WeightInit        WeightInit
+    BatchNormMomentum float64
+}
+```
+
+<ParamField path="body.InputSize" type="int" required>
+  Number of input features per sample.
+</ParamField>
+
+<ParamField path="body.OutputSize" type="int" required>
+  Number of output classes.
+</ParamField>
+
+<ParamField path="body.HiddenSize" type="[]int" required>
+  Widths of the hidden layers. `[]int{256, 128}` creates two hidden layers of width 256 and 128.
+</ParamField>
+
+<ParamField path="body.WeightInit" type="WeightInit" required>
+  A function `func(prevNodeNum int) float64` that returns the initial weight scale. Use `weight.He`, `weight.Xavier`, or `weight.Glorot` from the `weight` package, or `weight.Std(0.01)` for a fixed standard deviation.
+</ParamField>
+
+<ParamField path="body.BatchNormMomentum" type="float64">
+  Momentum for the running statistics in each BatchNorm layer. Typical value: `0.9`.
+</ParamField>
+
+```go
+m := model.NewMLP(&model.MLPConfig{
+    InputSize:         784,
+    OutputSize:        10,
+    HiddenSize:        []int{256, 128},
+    WeightInit:        weight.He,
+    BatchNormMomentum: 0.9,
+})
+```
+
+`MLP` inherits all methods from `Sequential` and overrides `Summary()` to print `*model.MLP` as the type header.
+
+---
+
+## Recurrent language models
+
+For sequence modelling, neu provides three language model variants that wrap `TimeLayer` slices instead of `Layer` slices.
+
+<Tabs>
+  <Tab title="RNNLM">
+    Uses a single `TimeRNN` cell. Stack: `TimeEmbedding → TimeRNN → TimeAffine → TimeSoftmaxWithLoss`.
+
+    ```go
+    m := model.NewRNNLM(&model.RNNLMConfig{
+        VocabSize:   10000,
+        WordVecSize: 100,
+        HiddenSize:  100,
+        WeightInit:  weight.Xavier,
+    })
+    ```
+
+    <ParamField path="body.VocabSize" type="int" required>
+      Number of distinct tokens in the vocabulary.
+    </ParamField>
+    <ParamField path="body.WordVecSize" type="int" required>
+      Embedding dimension `D`.
+    </ParamField>
+    <ParamField path="body.HiddenSize" type="int" required>
+      RNN hidden size `H`.
+    </ParamField>
+    <ParamField path="body.WeightInit" type="WeightInit" required>
+      Weight initializer function.
+    </ParamField>
+  </Tab>
+
+  <Tab title="LSTMLM">
+    A two-layer LSTM language model with dropout between layers. Stack: `TimeEmbedding → TimeDropout → TimeLSTM → TimeDropout → TimeLSTM → TimeDropout → TimeAffine → TimeSoftmaxWithLoss`.
+
+    ```go
+    m := model.NewLSTMLM(&model.LSTMLMConfig{
+        RNNLMConfig: model.RNNLMConfig{
+            VocabSize:   10000,
+            WordVecSize: 650,
+            HiddenSize:  650,
+            WeightInit:  weight.Xavier,
+        },
+        DropoutRatio: 0.5,
+    })
+    ```
+
+    <ParamField path="body.DropoutRatio" type="float64">
+      Dropout probability applied between each major layer block.
+    </ParamField>
+  </Tab>
+
+  <Tab title="GRULM">
+    Mirrors `LSTMLM` but replaces the two `TimeLSTM` layers with two `TimeGRU` layers.
+
+    ```go
+    m := model.NewGRULM(&model.LSTMLMConfig{
+        RNNLMConfig: model.RNNLMConfig{
+            VocabSize:   10000,
+            WordVecSize: 650,
+            HiddenSize:  650,
+            WeightInit:  weight.Xavier,
+        },
+        DropoutRatio: 0.5,
+    })
+    ```
+
+    GRU has fewer parameters than LSTM (3H vs 4H per layer) and can be faster to train.
+  </Tab>
+</Tabs>
+
+All three satisfy the `trainer.RNNLM` interface and are trained with `trainer.RNNLMTrainer`.
+
+---
+
+## Seq2Seq models
+
+Sequence-to-sequence models compose an encoder and a decoder into a single trainable unit. Three variants are available:
+
+<AccordionGroup>
+  <Accordion title="Seq2Seq">
+    Standard encoder-decoder using LSTM. The encoder reads the reversed input sequence and passes its final hidden state to the decoder.
+
+    ```go
+    m := model.NewSeq2Seq(&model.RNNLMConfig{
+        VocabSize:   13,
+        WordVecSize: 16,
+        HiddenSize:  128,
+        WeightInit:  weight.Xavier,
+    })
+    ```
+  </Accordion>
+
+  <Accordion title="PeekySeq2Seq">
+    A variant of `Seq2Seq` where the encoder's hidden state is concatenated with each decoder input at every decoding step ("peeky" decoder).
+
+    ```go
+    m := model.NewPeekySeq2Seq(&model.RNNLMConfig{
+        VocabSize:   13,
+        WordVecSize: 16,
+        HiddenSize:  128,
+        WeightInit:  weight.Xavier,
+    })
+    ```
+  </Accordion>
+
+  <Accordion title="AttentionSeq2Seq">
+    Adds a soft attention mechanism over all encoder hidden states. At each decoding step the decoder computes a weighted sum of encoder outputs, letting the model focus on relevant positions in the input.
+
+    ```go
+    m := model.NewAttentionSeq2Seq(&model.RNNLMConfig{
+        VocabSize:   13,
+        WordVecSize: 16,
+        HiddenSize:  128,
+        WeightInit:  weight.Xavier,
+    })
+    ```
+  </Accordion>
+</AccordionGroup>
+
+All three satisfy the `trainer.Seq2Seq` interface and are trained with `trainer.Seq2SeqTrainer`.
+
+---
+
+## QNet
+
+`QNet` is a feedforward network for reinforcement learning that uses `MeanSquaredError` as its loss function instead of `SoftmaxWithLoss`. It adds a `Sync` method that copies parameters from another `QNet` — the standard operation in deep Q-learning when updating a target network.
+
+```go
+m := model.NewQNet(&model.QNetConfig{
+    InputSize:  4,
+    OutputSize: 2,
+    HiddenSize: []int{128},
+    WeightInit: weight.He,
+})
+```
+
+---
+
+## Saving and loading parameters
+
+`model.Save` and `model.Load` persist and restore parameter slices using Go's `encoding/gob` format.
+
+```go
+// Save after training
+params := m.Params()  // [][]matrix.Matrix
+if err := model.Save("model.gob", params); err != nil {
+    log.Fatal(err)
+}
+
+// Load at inference time
+params, ok := model.Load("model.gob")
+if !ok {
+    log.Fatal("checkpoint not found")
+}
+m.SetParams(params)
+```
+
+`Save` creates the file if it does not exist. `Load` returns `(nil, false)` if the file is missing or cannot be decoded, so you can safely probe for a checkpoint at startup and train from scratch if none exists.
+
+<Warning>
+  The parameter layout must match the model that was used when saving. Loading parameters from an `LSTMLM` into an `RNNLM` will panic or silently produce incorrect results because the layer count and shapes differ.
+</Warning>

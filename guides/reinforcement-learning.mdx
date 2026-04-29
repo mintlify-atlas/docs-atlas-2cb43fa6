@@ -1,0 +1,317 @@
+---
+title: "Train RL agents on a grid world with neu"
+description: "Implement tabular Q-learning, SARSA, and Monte Carlo agents, then scale up to a DQN agent with experience replay and a target network — all in pure Go."
+---
+
+neu's `agent` package provides a self-contained reinforcement learning toolkit that runs in a 2D grid world environment. You can start with simple tabular methods that store Q-values in a hash map, then graduate to a deep Q-network (DQN) that uses a neural network to generalize across states — all without leaving Go or adding external dependencies.
+
+## The grid world environment
+
+`env.NewGridWorld` creates a 3 × 4 grid with a goal cell, a wall cell, and a hole (negative reward). The agent observes its current `(row, col)` position and can move in four directions. The environment implements the standard `Reset() → Step(action) → (next, reward, done)` loop:
+
+```go
+e := env.NewGridWorld()
+
+state := e.Reset()
+for {
+    action         := somePolicy(state)
+    next, reward, done := e.Step(action)
+    state = next
+    if done {
+        break
+    }
+}
+```
+
+For DQN, each state is converted to a one-hot vector with `e.OneHot(state)` so it can be fed directly into the neural network.
+
+## Tabular agents
+
+These agents store Q-values in a `DefaultMap[float64]` (a Go map with a default value of 0.0), keyed by `"state: action"` strings. They are well-suited for small discrete state spaces.
+
+<Tabs>
+  <Tab title="Q-Learning">
+    `QLearningAgent` uses the off-policy TD(0) update: the target is the **max** Q-value of the next state, regardless of which action the agent actually takes next.
+
+    ```go
+    a := &agent.QLearningAgent{
+        Gamma:      0.9,   // discount factor
+        Alpha:      0.8,   // learning rate
+        Epsilon:    0.1,   // ε-greedy exploration
+        ActionSize: len(e.ActionSpace),
+        Q:          agent.DefaultMap[float64]{},
+        Source:     rand.NewSource(rand.MustRead()),
+    }
+
+    // inside the episode loop
+    action := a.GetAction(state)
+    next, reward, done := e.Step(action)
+    a.Update(state, action, reward, next, done)
+    state = next
+    ```
+
+    The update rule is: `Q[s,a] += α * (r + γ * max_a' Q[s',a'] - Q[s,a])`
+  </Tab>
+
+  <Tab title="SARSA">
+    `SarsaAgent` uses the on-policy TD(0) update: the target uses the Q-value of the **actual next action** chosen by the current policy. It maintains a two-step memory `Deque` to look one step back:
+
+    ```go
+    a := &agent.SarsaAgent{
+        Gamma:          0.9,
+        Alpha:          0.8,
+        Epsilon:        0.1,
+        ActionSize:     len(e.ActionSpace),
+        DefaultActions: agent.RandomActions{0: 0.25, 1: 0.25, 2: 0.25, 3: 0.25},
+        Pi:             agent.DefaultMap[agent.RandomActions]{},
+        Q:              agent.DefaultMap[float64]{},
+        Memory:         agent.NewDeque[agent.Memory](2),
+        Source:         rand.NewSource(rand.MustRead()),
+    }
+
+    a.Update(state, action, reward, done)
+    ```
+
+    After each update, SARSA also refreshes the greedy policy `Pi[state]` using the current `Q` values and the ε-greedy probability formula.
+  </Tab>
+
+  <Tab title="Monte Carlo">
+    `MonteCarloAgent` waits until the end of an episode before updating Q-values, computing discounted returns backwards through the stored trajectory:
+
+    ```go
+    a := &agent.MonteCarloAgent{
+        Gamma:   0.9,
+        Alpha:   0.1,
+        Epsilon: 0.1,
+        ActionSize: len(e.ActionSpace),
+        DefaultActions: agent.RandomActions{0: 0.25, 1: 0.25, 2: 0.25, 3: 0.25},
+        Pi:      agent.DefaultMap[agent.RandomActions]{},
+        Q:       agent.DefaultMap[float64]{},
+        Source:  rand.NewSource(rand.MustRead()),
+    }
+
+    // during episode — accumulate trajectory
+    a.Add(state, action, reward)
+
+    // at episode end — update Q from the full return
+    a.Update()
+    a.Reset()
+    ```
+
+    The update sweeps `Memory` in reverse: `G = γ*G + r`, then `Q[s,a] += α * (G - Q[s,a])`.
+  </Tab>
+</Tabs>
+
+## DQN agent
+
+`DQNAgent` replaces the hash-map Q-table with two `model.QNet` neural networks: an online network `Q` that is updated every step, and a frozen target network `QTarget` that is synced periodically. Experience replay breaks temporal correlations by storing `(state, action, reward, next, done)` tuples in a `ReplayBuffer` and sampling random mini-batches for each update.
+
+### Agent struct
+
+```go
+type DQNAgent struct {
+    Gamma        float64         // discount factor
+    Epsilon      float64         // ε-greedy exploration rate
+    ReplayBuffer *ReplayBuffer   // experience replay store
+    ActionSize   int
+    Q            *model.QNet     // online network — updated every step
+    QTarget      *model.QNet     // target network — synced every N steps
+    Optimizer    *optimizer.Adam
+    Source       randv2.Source
+}
+```
+
+### Building the agent
+
+Both `Q` and `QTarget` are constructed with the same `QNetConfig` so their architectures are identical:
+
+```go
+e := env.NewGridWorld()
+a := &agent.DQNAgent{
+    Gamma:        0.98,
+    Epsilon:      0.1,
+    ActionSize:   len(e.ActionSpace),
+    ReplayBuffer: agent.NewReplayBuffer(10000, 2),
+    Q: model.NewQNet(&model.QNetConfig{
+        InputSize:  e.Size(),
+        OutputSize: len(e.ActionSpace),
+        HiddenSize: []int{128, 128},
+        WeightInit: weight.Xavier,
+    }),
+    QTarget: model.NewQNet(&model.QNetConfig{
+        InputSize:  e.Size(),
+        OutputSize: len(e.ActionSpace),
+        HiddenSize: []int{128, 128},
+        WeightInit: weight.Xavier,
+    }),
+    Optimizer: &optimizer.Adam{Alpha: 0.001, Beta1: 0.9, Beta2: 0.999},
+    Source:    rand.NewSource(rand.MustRead()),
+}
+```
+
+### Epsilon-greedy action selection
+
+`GetAction` draws a uniform random number. If it is below `Epsilon`, a random action is returned (exploration). Otherwise, the action with the highest Q-value from the online network is chosen (exploitation):
+
+```go
+func (a *DQNAgent) GetAction(state []float64) int {
+    g := randv2.New(a.Source)
+    if a.Epsilon > g.Float64() {
+        return g.IntN(a.ActionSize)  // explore
+    }
+    qs := a.Q.Predict(matrix.New(state))
+    return vector.Argmax(qs[0])     // exploit
+}
+```
+
+### Update loop
+
+Each call to `Update` performs four steps:
+
+1. **Add** the transition to the replay buffer.
+2. **Return early** if the buffer does not yet have enough samples for a full batch.
+3. **Sample** a random mini-batch and compute the Bellman target: `r + γ * max_a' QTarget(s', a')` (or just `r` when `done`).
+4. **Backprop** the MSE loss between the online network's predictions and the Bellman targets.
+
+```go
+func (a *DQNAgent) Update(state []float64, action int, reward float64,
+    next []float64, done bool) matrix.Matrix {
+
+    a.ReplayBuffer.Add(state, action, reward, next, done)
+    if a.ReplayBuffer.Len() < a.ReplayBuffer.BatchSize {
+        return matrix.New([]float64{0.0})
+    }
+
+    s, ac, r, n, d := a.ReplayBuffer.Batch()
+
+    qs     := a.Q.Predict(s)
+    q      := selectByAction(qs, ac)         // Q(s, a) for taken actions
+
+    nextqs := a.QTarget.Predict(n)
+    nextq  := nextqs.MaxAxis1()              // max_a' QTarget(s', a')
+    target := bellmanTarget(r, d, a.Gamma, nextq)
+
+    loss := a.Q.Loss(q, target)
+    a.Q.Backward()
+    a.Optimizer.Update(a.Q)
+    return loss
+}
+```
+
+Call `a.Sync()` every `syncInterval` episodes to copy the online network weights into the target network:
+
+```go
+if (i+1)%syncInterval == 0 {
+    a.Sync() // a.QTarget.Sync(a.Q)
+}
+```
+
+## Complete DQN example
+
+```go
+package main
+
+import (
+	"flag"
+	"fmt"
+
+	"github.com/itsubaki/neu/agent"
+	"github.com/itsubaki/neu/agent/env"
+	"github.com/itsubaki/neu/math/matrix"
+	"github.com/itsubaki/neu/math/rand"
+	"github.com/itsubaki/neu/model"
+	"github.com/itsubaki/neu/optimizer"
+	"github.com/itsubaki/neu/weight"
+)
+
+func main() {
+	var episode, syncInterval, hiddenSize, bufferSize, batchSize int
+	var gamma, epsilon, alpha, beta1, beta2 float64
+	flag.IntVar(&episode, "episode", 300, "")
+	flag.IntVar(&syncInterval, "sync-interval", 100, "")
+	flag.IntVar(&hiddenSize, "hidden-size", 128, "")
+	flag.IntVar(&bufferSize, "buffer-size", 10000, "")
+	flag.IntVar(&batchSize, "batch-size", 2, "")
+	flag.Float64Var(&gamma, "gamma", 0.98, "")
+	flag.Float64Var(&epsilon, "epsilon", 0.1, "")
+	flag.Float64Var(&alpha, "alpha", 0.001, "")
+	flag.Float64Var(&beta1, "beta1", 0.9, "")
+	flag.Float64Var(&beta2, "beta2", 0.999, "")
+	flag.Parse()
+
+	e := env.NewGridWorld()
+	a := &agent.DQNAgent{
+		Gamma:        gamma,
+		Epsilon:      epsilon,
+		ActionSize:   len(e.ActionSpace),
+		ReplayBuffer: agent.NewReplayBuffer(bufferSize, batchSize),
+		Q: model.NewQNet(&model.QNetConfig{
+			InputSize:  e.Size(),
+			OutputSize: len(e.ActionSpace),
+			HiddenSize: []int{hiddenSize, hiddenSize},
+			WeightInit: weight.Xavier,
+		}),
+		QTarget: model.NewQNet(&model.QNetConfig{
+			InputSize:  e.Size(),
+			OutputSize: len(e.ActionSpace),
+			HiddenSize: []int{hiddenSize, hiddenSize},
+			WeightInit: weight.Xavier,
+		}),
+		Optimizer: &optimizer.Adam{Alpha: alpha, Beta1: beta1, Beta2: beta2},
+		Source:    rand.NewSource(rand.MustRead()),
+	}
+
+	for i := range episode {
+		state := e.Reset()
+		var totalLoss, totalReward float64
+		var count int
+
+		for {
+			stateoh            := e.OneHot(state)
+			action             := a.GetAction(stateoh)
+			next, reward, done := e.Step(action)
+			loss               := a.Update(stateoh, action, reward, e.OneHot(next), done)
+			state = next
+
+			totalLoss += loss[0][0]
+			totalReward += reward
+			count++
+
+			if done {
+				break
+			}
+		}
+
+		if (i+1)%syncInterval == 0 {
+			a.Sync()
+			fmt.Printf("%d: sync\n", i)
+		}
+
+		if (i+1)%10 == 0 {
+			fmt.Printf("%d: %.8f, %.8f\n", i, totalLoss/float64(count), totalReward/float64(count))
+
+			for _, s := range e.State {
+				if s.Equal(e.GoalState) || s.Equal(e.WallState) {
+					continue
+				}
+				q := a.Q.Predict(matrix.New(e.OneHot(&s)))
+				for _, action := range e.Actions() {
+					fmt.Printf("%s %-6s: %.4f\n", s, e.ActionMeaning[action], q[0][action])
+				}
+			}
+		}
+	}
+}
+```
+
+## Running the example
+
+```bash
+go run cmd/dqn/main.go
+```
+
+Every 10 episodes the program prints the average loss and reward for that episode, plus the learned Q-values for each non-terminal cell and action. Every `syncInterval` episodes (default 100) it prints `sync` and copies the online network weights to the target network.
+
+<Note>
+  The grid world is small enough that tabular agents converge in tens of episodes. DQN typically needs a few hundred episodes to stabilize because the replay buffer needs to fill up and the target network needs at least one sync before the Bellman targets become meaningful.
+</Note>

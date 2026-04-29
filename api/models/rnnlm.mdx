@@ -1,0 +1,231 @@
+---
+title: "RNNLM language model API: RNN, LSTM, GRU, and generation"
+description: "API reference for RNNLM, LSTMLM, and GRULM language models in neu, plus RNNLMGen for text generation. Covers config fields, constructors, and usage examples."
+keywords: ["rnnlm", "lstm", "gru", "language model", "recurrent", "neu", "golang"]
+---
+
+The recurrent language models in neu all share a common structure: a `TimeEmbedding` layer maps token IDs to dense vectors, one or more recurrent layers model temporal dependencies, a `TimeAffine` layer projects hidden states back to vocabulary logits, and `TimeSoftmaxWithLoss` computes the cross-entropy loss. Three cell types are available — vanilla RNN, LSTM, and GRU — each built from the same `RNNLM` core.
+
+---
+
+## Shared base: RNNLM
+
+All three variants embed `RNNLM` directly and inherit its full method set.
+
+```go
+type RNNLM struct {
+    Layer  []TimeLayer
+    Source randv2.Source
+}
+```
+
+<ParamField path="body.Layer" type="[]TimeLayer" required>
+  Ordered slice of time-distributed layers. The final element is always `*layer.TimeSoftmaxWithLoss`. All preceding layers are executed during `Predict`; all layers including the loss run during `Forward`.
+</ParamField>
+
+<ParamField path="body.Source" type="randv2.Source">
+  Random source forwarded to stochastic layers such as `TimeDropout` during training.
+</ParamField>
+
+### RNNLM methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `Predict` | `func (m *RNNLM) Predict(xs []matrix.Matrix, opts ...layer.Opts) []matrix.Matrix` | Runs all layers except the loss layer. |
+| `Forward` | `func (m *RNNLM) Forward(xs, ts []matrix.Matrix) []matrix.Matrix` | Full forward pass including loss. |
+| `Backward` | `func (m *RNNLM) Backward() []matrix.Matrix` | Backpropagates gradient `[[[1]]]` through all layers in reverse. |
+| `Layers` | `func (m *RNNLM) Layers() []TimeLayer` | Returns the complete layer slice. |
+| `Params` | `func (m *RNNLM) Params() [][]matrix.Matrix` | Parameters grouped by layer. |
+| `Grads` | `func (m *RNNLM) Grads() [][]matrix.Matrix` | Gradients, valid after `Backward`. |
+| `SetParams` | `func (m *RNNLM) SetParams(p [][]matrix.Matrix)` | Overwrites all layer parameters. |
+| `ResetState` | `func (m *RNNLM) ResetState()` | Calls `ResetState` on every layer to clear hidden states between documents. |
+| `Summary` | `func (m *RNNLM) Summary() []string` | Returns a string description of each layer. |
+
+---
+
+## Three model variants
+
+<Tabs>
+  <Tab title="RNNLM">
+    The simplest variant. Uses a single stateful `TimeRNN` cell.
+
+    **Layer stack:** `TimeEmbedding → TimeRNN → TimeAffine → TimeSoftmaxWithLoss`
+
+    ### RNNLMConfig
+
+    ```go
+    type RNNLMConfig struct {
+        VocabSize   int
+        WordVecSize int
+        HiddenSize  int
+        WeightInit  WeightInit
+    }
+    ```
+
+    <ParamField path="body.VocabSize" type="int" required>
+      Number of distinct tokens in the vocabulary (`V`). Determines the embedding matrix shape `(V, D)` and the output projection shape `(H, V)`.
+    </ParamField>
+
+    <ParamField path="body.WordVecSize" type="int" required>
+      Embedding dimension `D`. Each token is mapped to a vector of this size.
+    </ParamField>
+
+    <ParamField path="body.HiddenSize" type="int" required>
+      RNN hidden size `H`. Controls the width of the recurrent layer and the output projection.
+    </ParamField>
+
+    <ParamField path="body.WeightInit" type="WeightInit" required>
+      Weight initialiser function `func(prevNodeNum int) float64`. `weight.Xavier` is a common choice for RNN cells.
+    </ParamField>
+
+    ### Constructor
+
+    ```go
+    func NewRNNLM(c *RNNLMConfig, s ...randv2.Source) *RNNLM
+    ```
+
+    ### Usage
+
+    ```go
+    m := model.NewRNNLM(&model.RNNLMConfig{
+        VocabSize:   10000,
+        WordVecSize: 100,
+        HiddenSize:  100,
+        WeightInit:  weight.Xavier,
+    })
+    ```
+  </Tab>
+
+  <Tab title="LSTMLM">
+    A two-layer LSTM language model with dropout applied between each major block for regularisation.
+
+    **Layer stack:** `TimeEmbedding → TimeDropout → TimeLSTM → TimeDropout → TimeLSTM → TimeDropout → TimeAffine → TimeSoftmaxWithLoss`
+
+    ### LSTMLMConfig
+
+    `LSTMLMConfig` embeds `RNNLMConfig` and adds one field:
+
+    ```go
+    type LSTMLMConfig struct {
+        RNNLMConfig
+        DropoutRatio float64
+    }
+    ```
+
+    <ParamField path="body.VocabSize" type="int" required>
+      Vocabulary size `V`.
+    </ParamField>
+
+    <ParamField path="body.WordVecSize" type="int" required>
+      Embedding dimension `D`.
+    </ParamField>
+
+    <ParamField path="body.HiddenSize" type="int" required>
+      LSTM hidden size `H`. Each LSTM layer uses weight matrices of shape `(D, 4H)` and `(H, 4H)`.
+    </ParamField>
+
+    <ParamField path="body.WeightInit" type="WeightInit" required>
+      Weight initialiser function.
+    </ParamField>
+
+    <ParamField path="body.DropoutRatio" type="float64">
+      Probability of masking a unit during training. Applied after the embedding layer, between the two LSTM layers, and after the second LSTM. Set to `0` to disable dropout.
+    </ParamField>
+
+    ### Constructor
+
+    ```go
+    func NewLSTMLM(c *LSTMLMConfig, s ...randv2.Source) *LSTMLM
+    ```
+
+    ### Usage
+
+    ```go
+    m := model.NewLSTMLM(&model.LSTMLMConfig{
+        RNNLMConfig: model.RNNLMConfig{
+            VocabSize:   10000,
+            WordVecSize: 650,
+            HiddenSize:  650,
+            WeightInit:  weight.Xavier,
+        },
+        DropoutRatio: 0.5,
+    })
+    ```
+  </Tab>
+
+  <Tab title="GRULM">
+    Mirrors `LSTMLM` in structure but replaces both `TimeLSTM` layers with `TimeGRU` layers. GRU uses three gate matrices per layer instead of four, making it slightly faster and cheaper to train than LSTM on the same hidden size.
+
+    **Layer stack:** `TimeEmbedding → TimeDropout → TimeGRU → TimeDropout → TimeGRU → TimeDropout → TimeAffine → TimeSoftmaxWithLoss`
+
+    `GRULM` reuses `LSTMLMConfig` — there is no separate `GRULMConfig`.
+
+    ### Constructor
+
+    ```go
+    func NewGRULM(c *LSTMLMConfig, s ...randv2.Source) *GRULM
+    ```
+
+    ### Usage
+
+    ```go
+    m := model.NewGRULM(&model.LSTMLMConfig{
+        RNNLMConfig: model.RNNLMConfig{
+            VocabSize:   10000,
+            WordVecSize: 650,
+            HiddenSize:  650,
+            WeightInit:  weight.Xavier,
+        },
+        DropoutRatio: 0.5,
+    })
+    ```
+
+    <Tip>
+      GRU and LSTM achieve similar perplexity on many tasks. Prefer GRU when parameter count or training time matters, and LSTM when you need the longest-range memory.
+    </Tip>
+  </Tab>
+</Tabs>
+
+---
+
+## RNNLMGen
+
+`RNNLMGen` embeds `GRULM` and adds a `Generate` method for autoregressive text generation. It samples one token at a time using the softmax distribution over the vocabulary.
+
+```go
+type RNNLMGen struct {
+    GRULM
+}
+```
+
+### Constructor
+
+```go
+func NewRNNLMGen(c *LSTMLMConfig, s ...randv2.Source) *RNNLMGen
+```
+
+Accepts the same `LSTMLMConfig` as `NewGRULM`. The underlying GRU model must be trained (or have parameters loaded) before `Generate` produces meaningful output.
+
+### Generate
+
+```go
+func (g *RNNLMGen) Generate(startID int, skipIDs []int, length int) []int
+```
+
+Autoregressively samples `length` token IDs beginning from the seed token `startID`. Token IDs in `skipIDs` are rejected and the loop continues until `length` valid tokens have been sampled.
+
+Internally, at each step the method:
+1. Runs `Predict` on the current token to obtain vocabulary logits.
+2. Applies softmax to produce a probability distribution.
+3. Samples one token index from that distribution using the model's `Source`.
+4. Skips the sample if it appears in `skipIDs`.
+
+```go
+// Load a trained model, then generate 100 tokens starting from BOS token (id=0)
+generated := gen.Generate(0, []int{0}, 100)
+// Convert generated IDs back to text using your corpus vocabulary map
+```
+
+<Note>
+  Call `m.ResetState()` before each new sequence to prevent hidden states from a previous sequence from leaking into the generation.
+</Note>

@@ -1,0 +1,260 @@
+---
+title: "Train an MNIST image classifier with neu"
+description: "Build and train a multi-layer perceptron on the MNIST handwritten digit dataset using neu, a zero-dependency deep learning framework for Go."
+---
+
+neu makes it straightforward to train a fully-connected image classifier on MNIST: load the binary dataset files, normalize pixel values, construct an MLP with batch normalization, then run the AdaGrad optimizer for a handful of epochs — all in pure Go with no third-party dependencies.
+
+## Prerequisites
+
+- Go 1.22 or later
+- Clone the repository: `git clone https://github.com/itsubaki/neu.git && cd neu`
+
+<Steps>
+  <Step title="Download the MNIST dataset">
+    neu reads the original IDX-format gzip files directly. Download all four files into `testdata/` with the Makefile target:
+
+    ```bash
+    make mnistdl
+    ```
+
+    This runs four `curl` commands that fetch the training images, training labels, test images, and test labels from Google's CVDF mirror.
+
+    <Note>
+      The files stay in gzip form on disk. `mnist.Load` decompresses them in memory at load time, so no extra disk space is required for raw IDX files.
+    </Note>
+  </Step>
+
+  <Step title="Load and preprocess the data">
+    `mnist.Load` returns two `*mnist.Dataset` values — 60,000 training samples and 10,000 test samples. Two helper functions prepare them for the model:
+
+    - `mnist.Normalize` divides every pixel byte by 255, giving values in `[0, 1]`.
+    - `mnist.OneHot` converts each label (0–9) into a 10-element probability vector.
+
+    ```go
+    train, test := mnist.Must(mnist.Load(dir))
+
+    x  := matrix.New(mnist.Normalize(train.Image)...) // 60000 × 784
+    t  := matrix.New(mnist.OneHot(train.Label)...)    // 60000 × 10
+    xt := matrix.New(mnist.Normalize(test.Image)...)  // 10000 × 784
+    tt := matrix.New(mnist.OneHot(test.Label)...)     // 10000 × 10
+    ```
+  </Step>
+
+  <Step title="Build the MLP model">
+    `model.NewMLP` constructs an Affine → BatchNorm → ReLU stack for each hidden layer, followed by a final Affine + SoftmaxWithLoss output layer:
+
+    ```go
+    m := model.NewMLP(&model.MLPConfig{
+        InputSize:         mnist.Width * mnist.Height,                // 784
+        OutputSize:        mnist.Labels,                              // 10
+        HiddenSize:        []int{hiddenSize, hiddenSize, hiddenSize}, // [50, 50, 50]
+        WeightInit:        weight.He,
+        BatchNormMomentum: momentum, // default 0.9
+    })
+    ```
+
+    `weight.He` is appropriate for ReLU activations. `BatchNormMomentum` controls the running-mean update speed. Print the architecture before training:
+
+    ```go
+    fmt.Println(m.Summary()[0])
+    for i, s := range m.Summary()[1:] {
+        fmt.Printf("%2d: %v\n", i, s)
+    }
+    ```
+
+    Expected output:
+
+    ```
+    *model.MLP
+     0: *layer.Affine: W(784, 50), B(1, 50): 39250
+     1: *layer.BatchNorm: G(1, 50), B(1, 50): 100
+     2: *layer.ReLU
+     3: *layer.Affine: W(50, 50), B(1, 50): 2550
+     4: *layer.BatchNorm: G(1, 50), B(1, 50): 100
+     5: *layer.ReLU
+     6: *layer.Affine: W(50, 50), B(1, 50): 2550
+     7: *layer.BatchNorm: G(1, 50), B(1, 50): 100
+     8: *layer.ReLU
+     9: *layer.Affine: W(50, 10), B(1, 10): 510
+    10: *layer.SoftmaxWithLoss
+    ```
+  </Step>
+
+  <Step title="Train with AdaGrad">
+    Wrap the model and optimizer in a `trainer.Trainer`, then call `Fit`. The `Verbose` callback fires after every batch so you can track progress:
+
+    ```go
+    tr := trainer.New(m, &optimizer.AdaGrad{
+        LearningRate: learningRate, // default 0.01
+        Hooks: []optimizer.Hook{
+            hook.WeightDecay(lambda), // default 1e-6
+        },
+    })
+
+    tr.Fit(&trainer.Input{
+        Train:      x,
+        TrainLabel: t,
+        Epochs:     epochs,    // default 10
+        BatchSize:  batchSize, // default 100
+        Verbose: func(epoch, j int, loss float64, m trainer.Model) {
+            if j%(train.N/batchSize/10) != 0 {
+                return
+            }
+            mask  := trainer.Random(train.N, batchSize)
+            acc   := trainer.Accuracy(m.Predict(matrix.Batch(x, mask)), matrix.Batch(t, mask))
+            maskt := trainer.Random(test.N, batchSize)
+            y     := m.Predict(matrix.Batch(xt, maskt))
+            acct  := trainer.Accuracy(y, matrix.Batch(tt, maskt))
+            fmt.Printf("%3d,%4d: loss=%.04f, train_acc=%.04f, test_acc=%.04f\n",
+                epoch, j, loss, acc, acct)
+        },
+    })
+    ```
+
+    <Tip>
+      The `if j%... != 0` guard limits printed output to roughly 10 checkpoints per epoch, which keeps long runs readable.
+    </Tip>
+  </Step>
+
+  <Step title="Evaluate accuracy">
+    `trainer.Accuracy` compares `Argmax` of predicted probability vectors against one-hot labels and returns the fraction of correct predictions. After 10 epochs with default flags you should reach approximately **97 % test accuracy**.
+  </Step>
+</Steps>
+
+## Complete example
+
+```go
+package main
+
+import (
+	"flag"
+	"fmt"
+	"time"
+
+	"github.com/itsubaki/neu/dataset/mnist"
+	"github.com/itsubaki/neu/math/matrix"
+	"github.com/itsubaki/neu/model"
+	"github.com/itsubaki/neu/optimizer"
+	"github.com/itsubaki/neu/optimizer/hook"
+	"github.com/itsubaki/neu/trainer"
+	"github.com/itsubaki/neu/weight"
+)
+
+// go run cmd/mnist/main.go
+func main() {
+	var dir string
+	var epochs, hiddenSize, batchSize int
+	var momentum, learningRate, lambda float64
+	flag.StringVar(&dir, "dir", "./testdata", "")
+	flag.IntVar(&epochs, "epochs", 10, "")
+	flag.IntVar(&hiddenSize, "hidden-size", 50, "")
+	flag.IntVar(&batchSize, "batch-size", 100, "")
+	flag.Float64Var(&momentum, "batch-norm-momentum", 0.9, "")
+	flag.Float64Var(&learningRate, "learning-rate", 0.01, "")
+	flag.Float64Var(&lambda, "weight-decay", 1e-6, "")
+	flag.Parse()
+
+	train, test := mnist.Must(mnist.Load(dir))
+
+	x  := matrix.New(mnist.Normalize(train.Image)...) // 60000 * 784
+	t  := matrix.New(mnist.OneHot(train.Label)...)    // 60000 * 10
+	xt := matrix.New(mnist.Normalize(test.Image)...)  // 10000 * 784
+	tt := matrix.New(mnist.OneHot(test.Label)...)     // 10000 * 10
+
+	m := model.NewMLP(&model.MLPConfig{
+		InputSize:         mnist.Width * mnist.Height,
+		OutputSize:        mnist.Labels,
+		HiddenSize:        []int{hiddenSize, hiddenSize, hiddenSize},
+		WeightInit:        weight.He,
+		BatchNormMomentum: momentum,
+	})
+
+	fmt.Println(m.Summary()[0])
+	for i, s := range m.Summary()[1:] {
+		fmt.Printf("%2d: %v\n", i, s)
+	}
+	fmt.Println()
+
+	tr := trainer.New(m, &optimizer.AdaGrad{
+		LearningRate: learningRate,
+		Hooks: []optimizer.Hook{
+			hook.WeightDecay(lambda),
+		},
+	})
+
+	now := time.Now()
+	tr.Fit(&trainer.Input{
+		Train:      x,
+		TrainLabel: t,
+		Epochs:     epochs,
+		BatchSize:  batchSize,
+		Verbose: func(epoch, j int, loss float64, m trainer.Model) {
+			if j%(train.N/batchSize/10) != 0 {
+				return
+			}
+
+			mask    := trainer.Random(train.N, batchSize)
+			xbatch  := matrix.Batch(x, mask)
+			tbatch  := matrix.Batch(t, mask)
+			maskt   := trainer.Random(test.N, batchSize)
+			xtbatch := matrix.Batch(xt, maskt)
+			ttbatch := matrix.Batch(tt, maskt)
+
+			acc  := trainer.Accuracy(m.Predict(xbatch), tbatch)
+			y    := m.Predict(xtbatch)
+			acct := trainer.Accuracy(y, ttbatch)
+
+			fmt.Printf("%3d,%4d: loss=%.04f, train_acc=%.04f, test_acc=%.04f\n",
+				epoch, j, loss, acc, acct)
+			fmt.Printf("predict: %v\n", y.Argmax()[:20])
+			fmt.Printf("label  : %v\n", ttbatch.Argmax()[:20])
+			fmt.Println()
+		},
+	})
+
+	fmt.Printf("elapsed=%v\n", time.Since(now))
+}
+```
+
+## Expected output
+
+Loss decreases and accuracy improves across iterations. A typical run with default flags looks like:
+
+```
+   0,   0: loss=2.2485, train_acc=0.1800, test_acc=0.1300
+predict: [9 4 1 4 8 3 2 4 2 4 9 4 4 3 4 2 6 8 4 8]
+label  : [0 6 8 7 8 2 0 1 3 1 8 7 7 7 5 6 1 8 8 8]
+
+ 100,   0: loss=0.4916, train_acc=0.8800, test_acc=0.8900
+predict: [4 3 3 6 4 8 3 1 6 7 2 9 8 1 8 7 3 0 5 6]
+label  : [4 3 3 6 4 8 3 1 6 7 2 9 8 1 8 3 8 0 5 6]
+
+ 400,   0: loss=0.2036, train_acc=0.9400, test_acc=0.9500
+predict: [4 1 2 6 7 1 8 7 5 5 7 6 7 5 8 4 7 4 3 2]
+label  : [4 1 2 6 7 1 8 7 5 5 7 6 7 5 8 4 7 4 3 2]
+```
+
+## Saving and loading weights
+
+`model.Save` and `model.Load` are package-level functions that serialize and restore parameter slices using `encoding/gob`:
+
+```go
+import "github.com/itsubaki/neu/model"
+
+// after training
+if err := model.Save("mnist_weights.gob", m.Params()); err != nil {
+    log.Fatal(err)
+}
+
+// in a later process — construct the same MLPConfig first, then restore
+params, ok := model.Load("mnist_weights.gob")
+if !ok {
+    log.Fatal("failed to load checkpoint")
+}
+m.SetParams(params)
+```
+
+<Note>
+  `model.Load` returns `([][]matrix.Matrix, bool)` rather than an error. The boolean is `false` if the file does not exist or cannot be decoded. Construct the model with the same `MLPConfig` before calling `SetParams` — parameter shapes must match exactly.
+</Note>

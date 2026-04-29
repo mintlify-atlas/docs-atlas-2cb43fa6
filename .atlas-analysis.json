@@ -1,0 +1,115 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "neu",
+  "projectDescription": "A deep learning framework written in Go using only the standard library, supporting feedforward networks, RNNs, LSTMs, attention mechanisms, and reinforcement learning agents.",
+  "theme": "palm",
+  "primaryColor": "#ffffff",
+  "lightColor": "#74d7ed",
+  "darkColor": "#38484e",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/layers",
+              "concepts/models",
+              "concepts/optimizers",
+              "concepts/training"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/mnist",
+              "guides/rnn-language-model",
+              "guides/seq2seq",
+              "guides/reinforcement-learning"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Layers",
+            "pages": [
+              "api/layers/feedforward",
+              "api/layers/recurrent",
+              "api/layers/attention"
+            ]
+          },
+          {
+            "group": "Models",
+            "pages": [
+              "api/models/sequential",
+              "api/models/rnnlm",
+              "api/models/seq2seq",
+              "api/models/qnet"
+            ]
+          },
+          {
+            "group": "Training",
+            "pages": [
+              "api/optimizers",
+              "api/trainer",
+              "api/weight-init"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/math",
+              "api/datasets"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Zero external dependencies — uses only the Go standard library",
+    "Feedforward layers: Affine, BatchNorm, Dropout, ReLU, Sigmoid, Softmax",
+    "Recurrent layers: RNN, LSTM, GRU, BiLSTM with time-step variants",
+    "Attention mechanism layers for sequence-to-sequence models",
+    "Pre-built models: MLP, CBOW, RNNLM, Seq2Seq, PeekySeq2Seq, AttentionSeq2Seq",
+    "Optimizers: SGD, Momentum, AdaGrad, Adam with hook support (WeightDecay, GradsClipping)",
+    "Reinforcement learning agents: Q-Learning, SARSA, Monte Carlo, DQN",
+    "Model persistence via gob encoding (Save/Load params)",
+    "Built-in datasets: MNIST, Penn Treebank (PTB), arithmetic sequence"
+  ],
+  "publicApiSurface": [
+    "model.NewMLP(*MLPConfig) *MLP",
+    "model.NewSequential([]Layer, Source) *Sequential",
+    "model.NewSeq2Seq / NewPeekySeq2Seq / NewAttentionSeq2Seq",
+    "model.NewRNNLM / NewLSTMLM / NewGRULM / NewRNNLMGen",
+    "model.NewCBOW / NewCBOWNegativeSampling",
+    "model.NewQNet",
+    "model.Save(filename, params) / model.Load(filename)",
+    "trainer.New(Model, Optimizer) *Trainer",
+    "trainer.Trainer.Fit(*Input)",
+    "trainer.Accuracy(y, t matrix.Matrix) float64",
+    "optimizer.SGD / Momentum / AdaGrad / Adam",
+    "optimizer.Hook (WeightDecay, GradsClipping)",
+    "layer.Affine / BatchNorm / Dropout / ReLU / Sigmoid / Softmax / SoftmaxWithLoss",
+    "layer.RNN / LSTM / GRU / TimeLSTM / TimeGRU / TimeBiLSTM",
+    "layer.Attention / AttentionWeight / WeightSum / TimeAttention",
+    "layer.Embedding / TimeEmbedding / EmbeddingDot / NegativeSamplingLoss",
+    "activation.ReLU / Sigmoid / Softmax / Tanh / Step / Identity",
+    "loss.CrossEntropyError / MeanSquaredError / SumSquaredError",
+    "weight.He / Xavier / Glorot / Std",
+    "agent.Agent / DQNAgent / QLearning / SARSA / MonteCarlo",
+    "math/matrix.Matrix (New, Zero, One, Randn, MatMul, ...)",
+    "dataset/mnist.Load / Normalize / OneHot"
+  ]
+}

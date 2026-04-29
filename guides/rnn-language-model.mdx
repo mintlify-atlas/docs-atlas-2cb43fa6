@@ -1,0 +1,257 @@
+---
+title: "Train an RNN language model on Penn Treebank"
+description: "Train vanilla RNN, LSTM, and GRU language models on the Penn Treebank corpus using neu's truncated BPTT trainer, then generate text with RNNLMGen."
+---
+
+Language modeling is the task of predicting the next word in a sequence given all preceding words. neu provides three ready-made recurrent architectures — a vanilla `RNNLM`, a two-layer `LSTMLM`, and a two-layer `GRULM` — all trained through the same `RNNLMTrainer` using truncated backpropagation through time (TBPTT). This guide walks through downloading the Penn Treebank corpus, training an LSTM language model, and optionally generating new text.
+
+## Prerequisites
+
+- Go 1.22 or later
+- Clone the repository: `git clone https://github.com/itsubaki/neu.git && cd neu`
+
+## Download the Penn Treebank dataset
+
+neu expects three plain-text PTB splits in `testdata/`. Download them with:
+
+```bash
+make ptbdl
+```
+
+This fetches the train, validation, and test files from the Zalandoresearch LSTM repository:
+
+```bash
+curl -fs -o testdata/ptb.train.txt \
+  https://raw.githubusercontent.com/tomsercu/lstm/master/data/ptb.train.txt
+curl -fs -o testdata/ptb.test.txt  \
+  https://raw.githubusercontent.com/tomsercu/lstm/master/data/ptb.test.txt
+curl -fs -o testdata/ptb.valid.txt \
+  https://raw.githubusercontent.com/tomsercu/lstm/master/data/ptb.valid.txt
+```
+
+`ptb.Load` tokenizes the text on whitespace (replacing newlines with `<eos>`) and returns an integer `Corpus` plus bidirectional `WordToID`/`IDToWord` maps:
+
+```go
+train := ptb.Must(ptb.Load(dir, ptb.TrainTxt))
+corpus := train.Corpus // []int — word IDs
+```
+
+## Architecture variants
+
+All three models implement the `trainer.RNNLM` interface and train through the same `RNNLMTrainer`. Choose the one that fits your needs:
+
+<Tabs>
+  <Tab title="RNNLM (vanilla)">
+    `NewRNNLM` builds a single-layer vanilla RNN: `TimeEmbedding → TimeRNN → TimeAffine → TimeSoftmaxWithLoss`.
+
+    ```go
+    m := model.NewRNNLM(&model.RNNLMConfig{
+        VocabSize:   vector.Max(corpus) + 1,
+        WordVecSize: wordvecSize, // default 100
+        HiddenSize:  hiddenSize,  // default 100
+        WeightInit:  weight.Xavier,
+    })
+    ```
+
+    The `TimeRNN` layer is stateful — its hidden state carries over between TBPTT windows rather than resetting to zero each batch.
+  </Tab>
+
+  <Tab title="LSTMLM (two-layer LSTM)">
+    `NewLSTMLM` stacks two LSTM layers with `TimeDropout` between each: `TimeEmbedding → TimeDropout → TimeLSTM → TimeDropout → TimeLSTM → TimeDropout → TimeAffine → TimeSoftmaxWithLoss`.
+
+    ```go
+    m := model.NewLSTMLM(&model.LSTMLMConfig{
+        RNNLMConfig: model.RNNLMConfig{
+            VocabSize:   vector.Max(corpus) + 1,
+            WordVecSize: wordvecSize,  // default 100
+            HiddenSize:  hiddenSize,   // default 100
+            WeightInit:  weight.Xavier,
+        },
+        DropoutRatio: dropoutRatio, // default 0.5
+    })
+    ```
+
+    <Note>
+      Each `TimeLSTM` weight matrix `Wx` has shape `(D, 4*H)` because all four LSTM gates are computed in a single fused matrix multiplication.
+    </Note>
+  </Tab>
+
+  <Tab title="GRULM (two-layer GRU)">
+    `NewGRULM` mirrors LSTMLM but replaces each `TimeLSTM` with a `TimeGRU`. GRU uses two gates instead of four, so `Wx` has shape `(D, 3*H)` — fewer parameters for comparable sequence modeling ability.
+
+    ```go
+    m := model.NewGRULM(&model.LSTMLMConfig{
+        RNNLMConfig: model.RNNLMConfig{
+            VocabSize:   vector.Max(corpus) + 1,
+            WordVecSize: wordvecSize,
+            HiddenSize:  hiddenSize,
+            WeightInit:  weight.Xavier,
+        },
+        DropoutRatio: dropoutRatio,
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Training with truncated BPTT
+
+`trainer.NewRNNLM` implements truncated backpropagation through time. The corpus is treated as one long sequence divided across `BatchSize` parallel streams. Each iteration advances a shared `timeIdx` pointer by `TimeSize` steps, and the hidden state is **not** reset between iterations — only between epochs.
+
+```go
+tr := trainer.NewRNNLM(m, &optimizer.SGD{
+    LearningRate: learningRate, // default 0.1
+    Hooks: []optimizer.Hook{
+        hook.GradsClipping(max), // default max=0.25 — required for LSTM/GRU
+    },
+})
+
+tr.Fit(&trainer.RNNLMInput{
+    Train:      corpus[:len(corpus)-1],
+    TrainLabel: corpus[1:],           // one-step-ahead targets
+    Epochs:     epochs,               // default 10
+    BatchSize:  batchSize,            // default 10
+    TimeSize:   timeSize,             // TBPTT window, default 5
+    Verbose: func(epoch, j int, perplexity float64, m trainer.RNNLM) {
+        fmt.Printf("%2d, %2d: train_ppl=%.04f\n", epoch, j, perplexity)
+    },
+})
+```
+
+Perplexity is computed as `exp(average_loss)`. A newly initialized model on PTB typically starts above 10,000 and drops to the hundreds after a few epochs.
+
+## Complete LSTM example
+
+```go
+package main
+
+import (
+	"flag"
+	"fmt"
+	"time"
+
+	"github.com/itsubaki/neu/dataset/ptb"
+	"github.com/itsubaki/neu/math/vector"
+	"github.com/itsubaki/neu/model"
+	"github.com/itsubaki/neu/optimizer"
+	"github.com/itsubaki/neu/optimizer/hook"
+	"github.com/itsubaki/neu/trainer"
+	"github.com/itsubaki/neu/weight"
+)
+
+func main() {
+	var dir string
+	var epochs, corpusSize, wordvecSize, hiddenSize, batchSize, timeSize int
+	var learningRate, dropoutRatio, max float64
+	flag.StringVar(&dir, "dir", "./testdata", "")
+	flag.IntVar(&epochs, "epochs", 10, "")
+	flag.IntVar(&corpusSize, "corpus-size", -1, "")
+	flag.IntVar(&wordvecSize, "wordvec-size", 100, "")
+	flag.IntVar(&hiddenSize, "hidden-size", 100, "")
+	flag.IntVar(&batchSize, "batch-size", 10, "")
+	flag.IntVar(&timeSize, "time-size", 5, "")
+	flag.Float64Var(&dropoutRatio, "dropout-ratio", 0.5, "")
+	flag.Float64Var(&learningRate, "learning-rate", 0.1, "")
+	flag.Float64Var(&max, "grads-cliping-max", 0.25, "")
+	flag.Parse()
+
+	train := ptb.Must(ptb.Load(dir, ptb.TrainTxt))
+	corpus := train.Corpus
+	if corpusSize > 0 {
+		corpus = train.Corpus[:corpusSize]
+	}
+
+	m := model.NewLSTMLM(&model.LSTMLMConfig{
+		RNNLMConfig: model.RNNLMConfig{
+			VocabSize:   vector.Max(corpus) + 1,
+			WordVecSize: wordvecSize,
+			HiddenSize:  hiddenSize,
+			WeightInit:  weight.Xavier,
+		},
+		DropoutRatio: dropoutRatio,
+	})
+
+	fmt.Println(m.Summary()[0])
+	for i, s := range m.Summary()[1:] {
+		fmt.Printf("%2d: %v\n", i, s)
+	}
+	fmt.Println()
+
+	tr := trainer.NewRNNLM(m, &optimizer.SGD{
+		LearningRate: learningRate,
+		Hooks: []optimizer.Hook{
+			hook.GradsClipping(max),
+		},
+	})
+
+	now := time.Now()
+	tr.Fit(&trainer.RNNLMInput{
+		Train:      corpus[:len(corpus)-1],
+		TrainLabel: corpus[1:],
+		Epochs:     epochs,
+		BatchSize:  batchSize,
+		TimeSize:   timeSize,
+		Verbose: func(epoch, j int, perplexity float64, m trainer.RNNLM) {
+			fmt.Printf("%2d, %2d: train_ppl=%.04f\n", epoch, j, perplexity)
+		},
+	})
+
+	fmt.Printf("elapsed=%v\n", time.Since(now))
+}
+```
+
+## Running the examples
+
+<CodeGroup>
+  ```bash Vanilla RNN
+  make rnnlm
+  # go run cmd/rnnlm/main.go --dir ./testdata --corpus-size 1000
+  ```
+
+  ```bash LSTM
+  make rnnlm_lstm
+  # go run cmd/rnnlm_lstm/main.go --dir ./testdata --corpus-size 1000
+  ```
+
+  ```bash GRU
+  make rnnlm_gru
+  # go run cmd/rnnlm_gru/main.go --dir ./testdata --corpus-size 1000
+  ```
+</CodeGroup>
+
+The `--corpus-size 1000` flag truncates the training set to 1,000 tokens for a quick smoke test. Remove it (or set it to `-1`) to train on the full ~1 million-token PTB training split.
+
+## Generating text with RNNLMGen
+
+`model.RNNLMGen` extends the GRU language model with a `Generate` method that autoregressively samples word IDs, skipping tokens in a provided blocklist:
+
+```go
+m := model.NewRNNLMGen(&model.LSTMLMConfig{ /* same config */ })
+
+query   := []string{"the", "meaning", "of", "life", "is"}
+startID := train.WordToID[query[len(query)-1]]
+skipIDs := []int{
+    train.WordToID["N"],
+    train.WordToID["<unk>"],
+    train.WordToID["$"],
+}
+
+// prime the hidden state with all but the last query word
+for _, q := range query[:len(query)-1] {
+    m.Predict([]matrix.Matrix{{{float64(train.WordToID[q])}}})
+}
+
+wordIDs := m.Generate(startID, skipIDs, 100)
+```
+
+Run the generation command:
+
+```bash
+make rnnlm_gen
+# go run cmd/rnnlm_gen/main.go --dir ./testdata --epochs 0
+```
+
+`--epochs 0` skips training and runs generation immediately against any saved checkpoint.
+
+<Tip>
+  Use `model.Save` and `model.Load` to persist parameters between runs — they serialize `Params()` slices to a `.gob` file without any third-party dependency.
+</Tip>

@@ -1,133 +1,65 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "neu: Deep Learning in Go, Zero Dependencies"
+description: "neu is a deep learning framework written entirely in Go using only the standard library. Build and train neural networks, RNNs, and RL agents without any external dependencies."
 ---
 
-## Setting up
+neu is a deep learning framework built from scratch in Go, using only the Go standard library. It provides everything you need to build, train, and evaluate neural networks — from simple multi-layer perceptrons to LSTM-based language models, sequence-to-sequence models with attention, and deep reinforcement learning agents.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install neu and train your first model in minutes with a working code example.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Core Concepts" icon="book" href="/concepts/layers">
+    Understand layers, models, optimizers, and the training loop that powers neu.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Guides" icon="map" href="/guides/mnist">
+    Step-by-step walkthroughs for MNIST, language models, seq2seq, and RL agents.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/layers/feedforward">
+    Full reference for all layers, models, optimizers, and utility packages.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What you can build
 
-Everything you need to create world-class documentation.
+neu covers the full spectrum of deep learning architectures commonly used in research and production:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Feedforward Networks" icon="network-wired" href="/concepts/layers">
+    Build MLPs with Affine, BatchNorm, Dropout, ReLU, and Softmax layers.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Recurrent Models" icon="rotate" href="/api/layers/recurrent">
+    Train RNN, LSTM, GRU, and BiLSTM models for sequence tasks.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Seq2Seq with Attention" icon="arrows-left-right" href="/guides/seq2seq">
+    Implement encoder–decoder architectures with attention mechanisms.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Reinforcement Learning" icon="gamepad" href="/guides/reinforcement-learning">
+    Train Q-Learning, SARSA, Monte Carlo, and DQN agents from scratch.
   </Card>
-</Columns>
+</CardGroup>
 
-## Make your content agent ready
+## Get started
 
-Make your docs work for humans and AI agents alike.
+<Steps>
+  <Step title="Install the module">
+    Add neu to your Go module — no external dependencies required.
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+    ```bash
+    go get github.com/itsubaki/neu
+    ```
+  </Step>
+  <Step title="Build a model">
+    Compose layers into a Sequential model or use one of the pre-built architectures like MLP, RNNLM, or Seq2Seq.
+  </Step>
+  <Step title="Train with a Trainer">
+    Use `trainer.New(model, optimizer)` and call `Fit` with your dataset, batch size, and number of epochs.
+  </Step>
+  <Step title="Save and reload">
+    Persist trained weights to disk with `model.Save` and restore them with `model.Load`.
+  </Step>
+</Steps>
 
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Note>
+  neu uses only the Go standard library. There are no C bindings, no GPU dependencies, and no third-party packages to manage.
+</Note>

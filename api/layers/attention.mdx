@@ -1,0 +1,201 @@
+---
+title: "Attention Layers: Score, WeightSum, and Time"
+description: "Reference for neu's attention layers — AttentionWeight, WeightSum, Attention, and TimeAttention for encoder-decoder sequence models."
+keywords: ["neu", "attention", "encoder decoder", "attention weight", "weight sum", "time attention", "sequence to sequence", "deep learning", "go"]
+---
+
+Attention allows a decoder to selectively focus on different parts of an encoder's output at each decoding step. Rather than compressing the entire source sequence into a single fixed vector, the mechanism computes a probability distribution (the attention weights) over all encoder hidden states and forms a context vector as their weighted sum. In neu, this is factored into three composable layers: `AttentionWeight` computes the scores and normalizes them with softmax, `WeightSum` blends the encoder states using those scores, and `Attention` combines both into a single layer. `TimeAttention` applies `Attention` across every decoder time step.
+
+---
+
+## AttentionWeight
+
+Computes a scalar attention score for each encoder hidden state by taking the dot product between the state and the current decoder query, then normalizes the scores with softmax.
+
+<ParamField path="body.Softmax" type="*layer.Softmax" required>
+  Softmax layer used to normalize the raw dot-product scores. Must be initialized before use: `&layer.Softmax{}`.
+</ParamField>
+
+No learnable parameters — the scoring function is purely a dot product.
+
+**Signature**
+
+```go
+func (l *AttentionWeight) Forward(hs []matrix.Matrix, h matrix.Matrix) matrix.Matrix
+func (l *AttentionWeight) Backward(da matrix.Matrix) (dhs []matrix.Matrix, dh matrix.Matrix)
+```
+
+- `hs` — encoder hidden states, a slice of `T` matrices each of shape `(N, H)`.
+- `h` — current decoder query of shape `(N, H)`.
+- Returns an attention weight matrix of shape `(T, N)`, where each column sums to 1 over the `T` time steps.
+
+`Backward` returns `dhs` of shape `(T, N, H)` (gradient with respect to each encoder state) and `dh` of shape `(N, H)` (gradient with respect to the decoder query).
+
+```go
+aw := &layer.AttentionWeight{Softmax: &layer.Softmax{}}
+
+// hs: T encoder hidden states, each (N, H)
+// h:  current decoder hidden state (N, H)
+a := aw.Forward(hs, h) // (T, N) — attention weights
+
+dhs, dh := aw.Backward(da) // da shape: (T, N)
+```
+
+---
+
+## WeightSum
+
+Computes the context vector as a weighted sum of the encoder hidden states using the attention weights produced by `AttentionWeight`.
+
+No learnable parameters.
+
+**Signature**
+
+```go
+func (l *WeightSum) Forward(hs []matrix.Matrix, a matrix.Matrix) matrix.Matrix
+func (l *WeightSum) Backward(dc matrix.Matrix) (dhs []matrix.Matrix, da matrix.Matrix)
+```
+
+- `hs` — encoder hidden states `(T, N, H)`.
+- `a` — attention weights `(T, N)` from `AttentionWeight`.
+- Returns a context vector of shape `(N, H)`: a convex combination of the encoder states.
+
+`Backward` returns `dhs` of shape `(T, N, H)` and `da` of shape `(T, N)`.
+
+```go
+ws := &layer.WeightSum{}
+
+// a: attention weights (T, N)
+ctx := ws.Forward(hs, a) // context vector (N, H)
+
+dhs, da := ws.Backward(dctx) // dctx shape: (N, H)
+```
+
+---
+
+## Attention
+
+Combines `AttentionWeight` and `WeightSum` into one layer. Call `Forward` with the encoder states and the current decoder query; it internally calls `AttentionWeight.Forward` followed by `WeightSum.Forward` and returns the context vector directly.
+
+<ParamField path="body.AttentionWeight" type="*layer.AttentionWeight" required>
+  Attention scoring sub-layer. Initialize with `&layer.AttentionWeight{Softmax: &layer.Softmax{}}`.
+</ParamField>
+
+<ParamField path="body.WeightSum" type="*layer.WeightSum" required>
+  Context aggregation sub-layer. Initialize with `&layer.WeightSum{}`.
+</ParamField>
+
+No learnable parameters.
+
+**Signature**
+
+```go
+func (l *Attention) Forward(hs []matrix.Matrix, h matrix.Matrix) matrix.Matrix
+func (l *Attention) Backward(dout matrix.Matrix) (dhs []matrix.Matrix, dh matrix.Matrix)
+```
+
+- `hs` — encoder hidden states `(T, N, H)`.
+- `h` — decoder query `(N, H)`.
+- Returns context vector `(N, H)`.
+
+`Backward` fans gradients back through both sub-layers and sums the `dhs` contributions using `tensor.Add`.
+
+```go
+attn := &layer.Attention{
+    AttentionWeight: &layer.AttentionWeight{Softmax: &layer.Softmax{}},
+    WeightSum:       &layer.WeightSum{},
+}
+
+ctx := attn.Forward(encoderHs, decoderH) // (N, H)
+dhs, dh := attn.Backward(dctx)
+```
+
+<Note>
+  `Attention` satisfies the `model.AttentionLayer` interface:
+  `Forward(hs []matrix.Matrix, a matrix.Matrix) matrix.Matrix` and
+  `Backward(da matrix.Matrix) ([]matrix.Matrix, matrix.Matrix)`.
+</Note>
+
+---
+
+## TimeAttention
+
+Applies one `Attention` layer per decoder time step, collecting the context vectors into a slice. Each step attends over the full set of encoder hidden states independently.
+
+No learnable parameters.
+
+**Signature**
+
+```go
+func (l *TimeAttention) Forward(hsenc, hsdec []matrix.Matrix) []matrix.Matrix
+func (l *TimeAttention) Backward(dout []matrix.Matrix) (dhsenc, dhsdec []matrix.Matrix)
+```
+
+- `hsenc` — encoder hidden states `(T_enc, N, H)`.
+- `hsdec` — decoder hidden states `(T_dec, N, H)`, one per decoding step.
+- Returns `out` of length `T_dec`, each element a context vector `(N, H)`.
+
+`Backward` returns:
+- `dhsenc` — accumulated gradient for encoder states `(T_enc, N, H)`.
+- `dhsdec` — gradient per decoder step `(T_dec, N, H)`.
+
+```go
+ta := &layer.TimeAttention{}
+
+// hsenc: encoder output slice (T_enc matrices of shape (N, H))
+// hsdec: decoder hidden states (T_dec matrices of shape (N, H))
+ctxs := ta.Forward(hsenc, hsdec) // []matrix.Matrix of length T_dec
+
+dhsenc, dhsdec := ta.Backward(dctxs)
+```
+
+---
+
+## Encoder-decoder pattern
+
+The typical attention-based seq2seq setup uses `TimeLSTM` as the encoder, `TimeLSTM` as the decoder, `TimeAttention` to compute context vectors, and `TimeAffine` + `TimeSoftmaxWithLoss` to produce and score output tokens.
+
+<AccordionGroup>
+  <Accordion title="Encoder forward pass">
+
+```go
+// encoderLSTM: *layer.TimeLSTM, Stateful: false
+encoderHs := encoderLSTM.Forward(srcXs, nil) // (T_enc, N, H)
+```
+
+  </Accordion>
+  <Accordion title="Decoder forward pass with attention">
+
+```go
+// Pass the encoder final hidden state to the decoder
+encoderLSTM.Backward(make([]matrix.Matrix, len(encoderHs))) // dummy pass if not training encoder
+h := encoderLSTM.DH() // final encoder hidden state gradient carrier
+
+decoderLSTM.SetState(h)
+decoderHs := decoderLSTM.Forward(tgtXs, nil) // (T_dec, N, H)
+
+// Compute context vectors
+ta := &layer.TimeAttention{}
+ctxs := ta.Forward(encoderHs, decoderHs) // (T_dec, N, H)
+
+// Concatenate context with decoder hidden states before projection
+// (concatenation is application-level; apply TimeAffine to ctxs or merged input)
+```
+
+  </Accordion>
+  <Accordion title="Loss computation">
+
+```go
+affine := &layer.TimeAffine{W: Wout, B: Bout}
+logits := affine.Forward(ctxs, nil)
+
+lossLayer := &layer.TimeSoftmaxWithLoss{}
+loss := lossLayer.Forward(logits, targets)
+```
+
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+  Because `TimeAttention` has no learnable parameters, its `Params()` and `Grads()` return empty slices. Weight updates flow entirely through the encoder and decoder `TimeLSTM` layers.
+</Tip>

@@ -1,0 +1,56 @@
+---
+title: "neu: Deep Learning Framework for Go Developers"
+description: "neu is a pure-Go deep learning framework with zero external dependencies. Build feedforward networks, RNNs, seq2seq models, and RL agents entirely in Go."
+keywords: ["go", "deep learning", "neural network", "machine learning", "neu", "golang ml"]
+---
+
+neu is a deep learning framework written entirely in Go, with no dependencies outside the standard library. It gives Go developers a complete toolkit for building and training neural networks — from simple multilayer perceptrons to sequence-to-sequence models with attention and reinforcement learning agents — without pulling in Python, NumPy, or any C extensions.
+
+## Who it's for
+
+neu is aimed at Go developers who want to build machine learning systems that ship as ordinary Go binaries. If you need reproducible, dependency-free ML inference or training in a Go service, neu lets you stay in the Go ecosystem end-to-end.
+
+<Note>
+  neu requires Go 1.22 or later. Because it uses only the standard library, `go get` is all you need — no system libraries, no CGO, no virtual environments.
+</Note>
+
+## Architecture overview
+
+neu is organized into focused packages that each own one concern. You can import only the packages you need, and the entire module compiles with `go build` and no additional setup.
+
+<CardGroup cols={2}>
+  <Card title="layer" icon="layer-group">
+    Primitive building blocks: Affine, ReLU, BatchNorm, Dropout, Sigmoid, Softmax, Embedding, RNN, LSTM, GRU, Attention, and their time-distributed variants.
+  </Card>
+  <Card title="model" icon="microchip">
+    Composed architectures built from layers: MLP, Sequential, RNNLM, Encoder/Decoder, Seq2Seq, PeekySeq2Seq, AttentionSeq2Seq, CBOW, and QNet for RL.
+  </Card>
+  <Card title="optimizer" icon="sliders">
+    Parameter update rules: SGD, Momentum, AdaGrad, and Adam. Each optimizer accepts optional gradient hooks for regularization such as weight decay and gradient clipping.
+  </Card>
+  <Card title="trainer" icon="play">
+    Training loop abstraction. `trainer.Trainer` takes any `Model` and `Optimizer`, shuffles data each epoch, batches inputs, and calls your `Verbose` callback at intervals you choose.
+  </Card>
+  <Card title="agent" icon="robot">
+    Reinforcement learning agents: Q-Learning, SARSA, off-policy SARSA, Monte Carlo, Temporal Difference, and DQN. The `agent/env` sub-package provides environments for testing.
+  </Card>
+  <Card title="math" icon="calculator">
+    Pure-Go linear algebra. `math/matrix` provides `Matrix` (a `[][]float64`), matrix multiplication, broadcasting, argmax, reshaping, and element-wise operations with no BLAS dependency.
+  </Card>
+</CardGroup>
+
+## Key capabilities
+
+- **Feedforward networks** — `model.MLP` builds a fully connected network with configurable hidden sizes, batch normalization, and He/Xavier/Glorot weight initialization in a single constructor call.
+- **Recurrent models** — `layer.RNN`, `layer.LSTM`, and `layer.GRU` plus their time-distributed counterparts (`layer.TimeRNN`, `layer.TimeLSTM`, `layer.TimeGRU`, `layer.TimeBiLSTM`) cover standard sequence tasks.
+- **Seq2seq with attention** — `model.AttentionSeq2Seq` and `model.PeekySeq2Seq` provide encoder-decoder architectures with attention mechanisms for tasks like machine translation and arithmetic sequence learning.
+- **Reinforcement learning** — The `agent` package implements tabular and deep RL algorithms. `model.QNet` pairs with `agent.DQN` for value-based deep RL.
+- **Model persistence** — `model.Save` and `model.Load` serialize trained parameters to disk using `encoding/gob`, so you can checkpoint and resume training or deploy weights to a separate binary.
+
+## Next steps
+
+Ready to train your first model? The quickstart walks through installing neu, building an MLP, and training it on MNIST in under 100 lines of Go.
+
+<Card title="Quickstart" icon="rocket" href="/quickstart">
+  Install neu and train a multilayer perceptron on MNIST step by step.
+</Card>

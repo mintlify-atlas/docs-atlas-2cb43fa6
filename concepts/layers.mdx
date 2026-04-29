@@ -1,0 +1,324 @@
+---
+title: "Layers: Building Blocks of Neural Networks in neu"
+description: "Explore neu's Layer interface and all available building blocks: feedforward layers (Affine, BatchNorm, Dropout), recurrent cells (LSTM, GRU), and Embedding layers."
+---
+
+Every computation in neu is expressed as a layer. A layer encapsulates a single mathematical transformation, stores the parameters and gradients it owns, and exposes a uniform interface for forward and backward passes. By composing layers you build arbitrarily deep networks without writing any gradient math by hand.
+
+## The Layer interface
+
+Every layer in neu satisfies the `model.Layer` interface:
+
+```go
+type Layer interface {
+    Forward(x, y matrix.Matrix, opts ...layer.Opts) matrix.Matrix
+    Backward(dout matrix.Matrix) (matrix.Matrix, matrix.Matrix)
+    Params() []matrix.Matrix
+    Grads() []matrix.Matrix
+    SetParams(p ...matrix.Matrix)
+    String() string
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Forward(x, y, opts)">
+    Runs the layer's forward computation. `x` is the primary input. `y` carries a secondary input (labels for loss layers, the previous hidden state for recurrent layers, or `nil` when unused). The variadic `opts` passes training flags and a random source.
+  </Accordion>
+  <Accordion title="Backward(dout)">
+    Runs backpropagation given the upstream gradient `dout`. Returns `(dx, nil)` for most layers. The second return value carries a gradient for the second input when the layer uses one (e.g., hidden-state gradient in recurrent cells).
+  </Accordion>
+  <Accordion title="Params() / Grads() / SetParams()">
+    `Params` and `Grads` return slices of `matrix.Matrix` in the same order. `SetParams` writes a new parameter set into the layer — used when loading a checkpoint with `model.Load`.
+  </Accordion>
+  <Accordion title="String()">
+    Returns a human-readable summary of the layer including its parameter count. Useful for printing model architecture.
+  </Accordion>
+</AccordionGroup>
+
+### layer.Opts
+
+Many layers behave differently during training and inference. Pass an `Opts` value to control this:
+
+```go
+type Opts struct {
+    Train  bool
+    Source randv2.Source
+}
+```
+
+<ParamField path="body.Train" type="bool">
+  When `true`, BatchNorm uses the current-batch statistics and Dropout randomly drops units. When `false` (inference), BatchNorm uses running statistics and Dropout scales the output by `(1 - Ratio)` instead.
+</ParamField>
+
+<ParamField path="body.Source" type="randv2.Source">
+  A `math/rand/v2` source used by Dropout to generate the random mask. Passing an explicit source makes dropout deterministic for reproducibility.
+</ParamField>
+
+---
+
+## Feedforward layers
+
+<Tabs>
+  <Tab title="Affine">
+    The fully-connected (dense) layer. Computes `x·W + B`.
+
+    ```go
+    l := &layer.Affine{
+        W: matrix.Randn(inputSize, outputSize, src).MulC(weight.He(inputSize)),
+        B: matrix.Zero(1, outputSize),
+    }
+    ```
+
+    **Exported fields:**
+
+    <ParamField path="body.W" type="matrix.Matrix">
+      Weight matrix of shape `(inputSize, outputSize)`. Holds the trainable weights.
+    </ParamField>
+    <ParamField path="body.B" type="matrix.Matrix">
+      Bias matrix of shape `(1, outputSize)`.
+    </ParamField>
+    <ParamField path="body.DW" type="matrix.Matrix">
+      Gradient of `W`, populated after `Backward`.
+    </ParamField>
+    <ParamField path="body.DB" type="matrix.Matrix">
+      Gradient of `B`, populated after `Backward`.
+    </ParamField>
+
+    `Backward` returns `dx = dout · Wᵀ` and accumulates `DW = xᵀ · dout`, `DB = sum(dout, axis=0)`.
+  </Tab>
+
+  <Tab title="BatchNorm">
+    Batch normalization. During training it normalizes each feature over the batch, then scales and shifts by learnable parameters `Gamma` and `Beta`. During inference it uses running mean and variance accumulated with the given momentum.
+
+    ```go
+    l := &layer.BatchNorm{
+        Gamma:    matrix.One(1, hiddenSize),
+        Beta:     matrix.Zero(1, hiddenSize),
+        Momentum: 0.9,
+    }
+    ```
+
+    <ParamField path="body.Gamma" type="matrix.Matrix">
+      Scale parameter of shape `(1, features)`. Initialized to ones.
+    </ParamField>
+    <ParamField path="body.Beta" type="matrix.Matrix">
+      Shift parameter of shape `(1, features)`. Initialized to zeros.
+    </ParamField>
+    <ParamField path="body.Momentum" type="float64">
+      Exponential decay factor for the running mean and variance. Typical value: `0.9`.
+    </ParamField>
+
+    <Note>
+      BatchNorm reads `opts[0].Train` to switch between training and inference mode. Always pass `layer.Opts{Train: true}` during training.
+    </Note>
+  </Tab>
+
+  <Tab title="Dropout">
+    Randomly zeroes activations during training with probability `Ratio`. At inference time scales activations by `(1 - Ratio)`.
+
+    ```go
+    l := &layer.Dropout{Ratio: 0.5}
+    ```
+
+    <ParamField path="body.Ratio" type="float64">
+      Drop probability. A value of `0.5` drops half the units during training.
+    </ParamField>
+
+    Dropout uses `opts[0].Source` to generate the random mask, so you can control the random state per forward pass.
+
+    <Tip>
+      Dropout has no trainable parameters. `Params()` and `Grads()` both return empty slices.
+    </Tip>
+  </Tab>
+
+  <Tab title="Activation">
+    **ReLU** passes positive values unchanged and zeros out negatives. It stores a binary mask during forward so that backward can propagate gradients only through active units.
+
+    ```go
+    l := &layer.ReLU{}
+    ```
+
+    **Sigmoid** applies the logistic function element-wise. The backward pass uses the cached output to compute `σ(x) · (1 - σ(x))` without re-evaluating the exponential.
+
+    ```go
+    l := &layer.Sigmoid{}
+    ```
+
+    Both layers have no trainable parameters.
+  </Tab>
+
+  <Tab title="Loss">
+    **SoftmaxWithLoss** fuses the softmax normalization and cross-entropy loss into a single numerically stable layer. Forward returns a `(1, 1)` matrix containing the scalar loss. Backward returns `(y - t) / N` where `N` is the batch size.
+
+    ```go
+    l := &layer.SoftmaxWithLoss{}
+    ```
+
+    This layer expects the target `t` to be passed as the second argument to `Forward`:
+
+    ```go
+    loss := l.Forward(logits, labels)
+    ```
+
+    <Note>
+      For computing cross-entropy loss outside of the layer graph, use `loss.CrossEntropyError(y, t matrix.Matrix) float64` from the `github.com/itsubaki/neu/loss` package.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
+
+## Recurrent layers
+
+Recurrent layers maintain hidden state across time steps. The single-step variants (`RNN`, `LSTM`, `GRU`) process one time step at a time. The `Time*` wrappers unroll them across a full sequence in a single call.
+
+<Tabs>
+  <Tab title="RNN">
+    A vanilla recurrent cell. Computes:
+
+    ```
+    h_next = tanh(x·Wx + h·Wh + B)
+    ```
+
+    ```go
+    l := &layer.RNN{
+        Wx: matrix.Randn(inputSize, hiddenSize, src).MulC(weight.Xavier(inputSize)),
+        Wh: matrix.Randn(hiddenSize, hiddenSize, src).MulC(weight.Xavier(hiddenSize)),
+        B:  matrix.Zero(1, hiddenSize),
+    }
+    ```
+
+    **Parameters:** `Wx (D, H)`, `Wh (H, H)`, `B (1, H)`.
+
+    `Forward` signature: `Forward(x, h matrix.Matrix, opts ...Opts) matrix.Matrix`
+
+    The `TimeRNN` wrapper sequences multiple steps and optionally carries hidden state between batches (`Stateful: true`).
+  </Tab>
+
+  <Tab title="LSTM">
+    Long Short-Term Memory cell. Maintains both a hidden state `h` and a cell state `c`. Uses four gates (forget, input, cell candidate, output) computed in a single matrix multiplication:
+
+    ```
+    A = x·Wx + h·Wh + B   // shape (N, 4H)
+    f, g, i, o = split(A)
+    c_next = σ(f)·c + tanh(g)·σ(i)
+    h_next = σ(o)·tanh(c_next)
+    ```
+
+    ```go
+    l := &layer.LSTM{
+        Wx: matrix.Randn(inputSize, 4*hiddenSize, src).MulC(weight.He(inputSize)),
+        Wh: matrix.Randn(hiddenSize, 4*hiddenSize, src).MulC(weight.He(hiddenSize)),
+        B:  matrix.Zero(1, 4*hiddenSize),
+    }
+    ```
+
+    **Parameters:** `Wx (D, 4H)`, `Wh (H, 4H)`, `B (1, 4H)`.
+
+    `Forward` signature: `Forward(x, h, c matrix.Matrix, opts ...Opts) (hNext, cNext matrix.Matrix)`
+
+    The `TimeLSTM` and `TimeBiLSTM` wrappers handle full-sequence unrolling. `TimeBiLSTM` runs a forward and backward LSTM over the sequence and concatenates their outputs.
+  </Tab>
+
+  <Tab title="GRU">
+    Gated Recurrent Unit cell. Uses an update gate `z` and a reset gate `r`:
+
+    ```
+    z = σ(x·Wxz + h·Whz + bz)
+    r = σ(x·Wxr + h·Whr + br)
+    ĥ = tanh(x·Wxh + (h·r)·Whh + bh)
+    h_next = (1 - z)·h + z·ĥ
+    ```
+
+    ```go
+    l := &layer.GRU{
+        Wx: matrix.Randn(inputSize, 3*hiddenSize, src).MulC(weight.He(inputSize)),
+        Wh: matrix.Randn(hiddenSize, 3*hiddenSize, src).MulC(weight.He(hiddenSize)),
+        B:  matrix.Zero(1, 3*hiddenSize),
+    }
+    ```
+
+    **Parameters:** `Wx (D, 3H)`, `Wh (H, 3H)`, `B (1, 3H)`.
+
+    The `TimeGRU` wrapper sequences multiple steps and supports stateful operation.
+  </Tab>
+</Tabs>
+
+### Time layer interface
+
+All `Time*` layers satisfy `model.TimeLayer`:
+
+```go
+type TimeLayer interface {
+    Forward(xs, ys []matrix.Matrix, opts ...layer.Opts) []matrix.Matrix
+    Backward(dout []matrix.Matrix) []matrix.Matrix
+    Params() []matrix.Matrix
+    Grads() []matrix.Matrix
+    SetParams(p ...matrix.Matrix)
+    SetState(h ...matrix.Matrix)
+    ResetState()
+    String() string
+}
+```
+
+`SetState` injects an external hidden state (useful for encoder-decoder architectures). `ResetState` clears the hidden state between independent sequences.
+
+---
+
+## Embedding layers
+
+Embedding layers map integer token IDs to dense vectors by performing an index lookup into a weight matrix.
+
+```go
+l := &layer.Embedding{
+    W: matrix.Randn(vocabSize, embedSize, src).MulC(1.0 / 100),
+}
+```
+
+`Forward` takes an index matrix of shape `(N, 1)` where each element is a token ID. It returns the corresponding rows from `W`, giving a `(N, embedSize)` output.
+
+`Backward` accumulates gradients into `DW` at the rows indicated by the stored indices, leaving all other rows at zero.
+
+**TimeEmbedding** wraps `Embedding` for sequence inputs of shape `(T, N, 1)`, producing `(T, N, embedSize)`.
+
+<Tip>
+  Because embedding backward only touches a sparse subset of rows, weight updates are efficient even for large vocabularies.
+</Tip>
+
+---
+
+## Composing layers manually
+
+The following snippet assembles a small feedforward classifier from raw layer structs, matching the pattern used internally by `model.NewMLP`:
+
+```go
+import (
+    "github.com/itsubaki/neu/layer"
+    "github.com/itsubaki/neu/math/matrix"
+    "github.com/itsubaki/neu/math/rand"
+    "github.com/itsubaki/neu/weight"
+)
+
+src := rand.NewSource(rand.MustRead())
+
+layers := []model.Layer{
+    &layer.Affine{
+        W: matrix.Randn(784, 256, src).MulC(weight.He(784)),
+        B: matrix.Zero(1, 256),
+    },
+    &layer.BatchNorm{
+        Gamma:    matrix.One(1, 256),
+        Beta:     matrix.Zero(1, 256),
+        Momentum: 0.9,
+    },
+    &layer.ReLU{},
+    &layer.Dropout{Ratio: 0.5},
+    &layer.Affine{
+        W: matrix.Randn(256, 10, src).MulC(weight.He(256)),
+        B: matrix.Zero(1, 10),
+    },
+    &layer.SoftmaxWithLoss{},
+}
+```
+
+Each layer's `String()` method prints its type and parameter count, which is collected by `Sequential.Summary()` to give a per-layer architecture summary.

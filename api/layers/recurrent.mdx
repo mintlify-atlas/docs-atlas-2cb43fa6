@@ -1,0 +1,448 @@
+---
+title: "Recurrent Layers: RNN, LSTM, GRU, and Time Variants"
+description: "Reference for neu's recurrent layers — single-step RNN, LSTM, and GRU cells plus their time-unrolled, bidirectional, and auxiliary Time* wrappers."
+keywords: ["neu", "rnn", "lstm", "gru", "recurrent", "time series", "sequence", "bidirectional", "stateful", "deep learning", "go"]
+---
+
+The `layer` package provides single-step recurrent cells (`RNN`, `LSTM`, `GRU`) and their time-unrolled counterparts (`TimeRNN`, `TimeLSTM`, `TimeGRU`) that iterate across an entire sequence in one call. All recurrent layers implement `model.TimeLayer`, which adds `SetState` and `ResetState` methods for carrying hidden state between batches. Set `Stateful: true` to retain state across forward passes — essential for language modelling over long documents — or leave it `false` (the default) to zero-initialize state at the start of every call.
+
+---
+
+<Tabs>
+  <Tab title="Single-step cells">
+
+## RNN
+
+A vanilla recurrent cell: `h_next = tanh(x·Wx + h·Wh + B)`.
+
+<ParamField path="body.Wx" type="matrix.Matrix" required>
+  Input-to-hidden weight matrix `(D, H)`.
+</ParamField>
+
+<ParamField path="body.Wh" type="matrix.Matrix" required>
+  Hidden-to-hidden weight matrix `(H, H)`.
+</ParamField>
+
+<ParamField path="body.B" type="matrix.Matrix" required>
+  Bias row vector `(1, H)`.
+</ParamField>
+
+<ParamField path="body.DWx" type="matrix.Matrix">
+  Gradient with respect to `Wx`. Populated after `Backward`.
+</ParamField>
+
+<ParamField path="body.DWh" type="matrix.Matrix">
+  Gradient with respect to `Wh`. Populated after `Backward`.
+</ParamField>
+
+<ParamField path="body.DB" type="matrix.Matrix">
+  Gradient with respect to `B`. Populated after `Backward`.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *RNN) Forward(x, h matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *RNN) Backward(dhNext matrix.Matrix) (dx, dh matrix.Matrix)
+```
+
+`Forward` takes the current input `x` `(N, D)` and the previous hidden state `h` `(N, H)`, and returns `hNext` `(N, H)`. `Backward` returns gradients for both `x` and `h`.
+
+```go
+l := &layer.RNN{
+    Wx: matrix.Randn(D, H, nil).MulC(0.01),
+    Wh: matrix.Randn(H, H, nil).MulC(0.01),
+    B:  matrix.Zero(1, H),
+}
+hNext := l.Forward(x, hPrev)
+dx, dh := l.Backward(dhNext)
+```
+
+---
+
+## LSTM
+
+A long short-term memory cell with forget, input, output, and cell gates. Maintains both a hidden state `h` and a cell state `c`.
+
+<ParamField path="body.Wx" type="matrix.Matrix" required>
+  Input weight matrix `(D, 4H)` — columns are concatenated gate weights `[f, g, i, o]`.
+</ParamField>
+
+<ParamField path="body.Wh" type="matrix.Matrix" required>
+  Hidden weight matrix `(H, 4H)`.
+</ParamField>
+
+<ParamField path="body.B" type="matrix.Matrix" required>
+  Bias row vector `(1, 4H)`.
+</ParamField>
+
+<ParamField path="body.DWx" type="matrix.Matrix">
+  Gradient with respect to `Wx`.
+</ParamField>
+
+<ParamField path="body.DWh" type="matrix.Matrix">
+  Gradient with respect to `Wh`.
+</ParamField>
+
+<ParamField path="body.DB" type="matrix.Matrix">
+  Gradient with respect to `B`.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *LSTM) Forward(x, h, c matrix.Matrix, _ ...Opts) (hNext, cNext matrix.Matrix)
+func (l *LSTM) Backward(dhNext, dcNext matrix.Matrix) (dx, dhPrev, dcPrev matrix.Matrix)
+```
+
+Note that `Forward` returns two matrices (`hNext`, `cNext`) and `Backward` returns three gradients (`dx`, `dhPrev`, `dcPrev`). This signature differs from the standard `Layer` interface; `LSTM` is always used indirectly through `TimeLSTM` in practice.
+
+```go
+l := &layer.LSTM{
+    Wx: matrix.Randn(D, 4*H, nil).MulC(weight.He(D)),
+    Wh: matrix.Randn(H, 4*H, nil).MulC(weight.He(H)),
+    B:  matrix.Zero(1, 4*H),
+}
+hNext, cNext := l.Forward(x, hPrev, cPrev)
+dx, dhPrev, dcPrev := l.Backward(dhNext, dcNext)
+```
+
+---
+
+## GRU
+
+A gated recurrent unit with reset and update gates. Uses a single hidden state with no separate cell state.
+
+<ParamField path="body.Wx" type="matrix.Matrix" required>
+  Input weight matrix `(D, 3H)` — columns are `[z, r, h̃]` gate weights.
+</ParamField>
+
+<ParamField path="body.Wh" type="matrix.Matrix" required>
+  Hidden weight matrix `(H, 3H)`.
+</ParamField>
+
+<ParamField path="body.B" type="matrix.Matrix" required>
+  Bias row vector `(1, 3H)`.
+</ParamField>
+
+<ParamField path="body.DWx" type="matrix.Matrix">
+  Gradient with respect to `Wx`.
+</ParamField>
+
+<ParamField path="body.DWh" type="matrix.Matrix">
+  Gradient with respect to `Wh`.
+</ParamField>
+
+<ParamField path="body.DB" type="matrix.Matrix">
+  Gradient with respect to `B`.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *GRU) Forward(x, h matrix.Matrix, _ ...Opts) matrix.Matrix
+func (l *GRU) Backward(dhnext matrix.Matrix) (dx, dhprev matrix.Matrix)
+```
+
+```go
+l := &layer.GRU{
+    Wx: matrix.Randn(D, 3*H, nil).MulC(weight.He(D)),
+    Wh: matrix.Randn(H, 3*H, nil).MulC(weight.He(H)),
+    B:  matrix.Zero(1, 3*H),
+}
+hNext := l.Forward(x, hPrev)
+dx, dh := l.Backward(dhNext)
+```
+
+  </Tab>
+  <Tab title="Time* wrappers">
+
+## TimeRNN
+
+Unrolls an `RNN` cell across a sequence of `T` time steps in a single call. Shares `Wx`, `Wh`, `B` across all steps and accumulates gradients.
+
+<ParamField path="body.Wx" type="matrix.Matrix" required>
+  Input weight matrix `(D, H)`, shared across all time steps.
+</ParamField>
+
+<ParamField path="body.Wh" type="matrix.Matrix" required>
+  Hidden weight matrix `(H, H)`, shared across all time steps.
+</ParamField>
+
+<ParamField path="body.B" type="matrix.Matrix" required>
+  Bias `(1, H)`, shared across all time steps.
+</ParamField>
+
+<ParamField path="body.Stateful" type="bool" default="false">
+  When `true`, the hidden state `h` is preserved between `Forward` calls. When `false`, `h` is zeroed at the start of each call.
+</ParamField>
+
+<ParamField path="body.DWx" type="matrix.Matrix">
+  Accumulated gradient for `Wx` over all time steps.
+</ParamField>
+
+<ParamField path="body.DWh" type="matrix.Matrix">
+  Accumulated gradient for `Wh` over all time steps.
+</ParamField>
+
+<ParamField path="body.DB" type="matrix.Matrix">
+  Accumulated gradient for `B` over all time steps.
+</ParamField>
+
+**State management**
+
+```go
+func (l *TimeRNN) SetState(h ...matrix.Matrix)
+func (l *TimeRNN) ResetState()
+```
+
+**Signatures**
+
+```go
+func (l *TimeRNN) Forward(xs, _ []matrix.Matrix, _ ...Opts) []matrix.Matrix
+func (l *TimeRNN) Backward(dhs []matrix.Matrix) []matrix.Matrix
+```
+
+`xs` is a slice of `T` matrices each of shape `(N, D)`. Returns a slice of `T` hidden states each of shape `(N, H)`.
+
+```go
+l := &layer.TimeRNN{
+    Wx:       matrix.Randn(D, H, nil).MulC(0.01),
+    Wh:       matrix.Randn(H, H, nil).MulC(0.01),
+    B:        matrix.Zero(1, H),
+    Stateful: true,
+}
+hs := l.Forward(xs, nil) // xs: []matrix.Matrix of length T
+dxs := l.Backward(dhs)
+```
+
+---
+
+## TimeLSTM
+
+Unrolls an `LSTM` cell over `T` time steps. Manages both hidden state `h` and cell state `c` internally.
+
+<ParamField path="body.Wx" type="matrix.Matrix" required>
+  Shared input weight `(D, 4H)`.
+</ParamField>
+
+<ParamField path="body.Wh" type="matrix.Matrix" required>
+  Shared hidden weight `(H, 4H)`.
+</ParamField>
+
+<ParamField path="body.B" type="matrix.Matrix" required>
+  Shared bias `(1, 4H)`.
+</ParamField>
+
+<ParamField path="body.Stateful" type="bool" default="false">
+  Carry `h` and `c` across `Forward` calls when `true`.
+</ParamField>
+
+**State management**
+
+```go
+// SetState(h) or SetState(h, c) — pass both to restore a full checkpoint
+func (l *TimeLSTM) SetState(s ...matrix.Matrix)
+func (l *TimeLSTM) ResetState()
+// DH returns the gradient of h at the earliest time step (useful for encoder–decoder)
+func (l *TimeLSTM) DH() matrix.Matrix
+```
+
+**Signatures**
+
+```go
+func (l *TimeLSTM) Forward(xs, _ []matrix.Matrix, _ ...Opts) []matrix.Matrix
+func (l *TimeLSTM) Backward(dhs []matrix.Matrix) []matrix.Matrix
+```
+
+```go
+l := &layer.TimeLSTM{
+    Wx:       matrix.Randn(D, 4*H, nil).MulC(weight.He(D)),
+    Wh:       matrix.Randn(H, 4*H, nil).MulC(weight.He(H)),
+    B:        matrix.Zero(1, 4*H),
+    Stateful: false,
+}
+hs := l.Forward(xs, nil)
+dxs := l.Backward(dhs)
+```
+
+---
+
+## TimeGRU
+
+Unrolls a `GRU` cell over `T` time steps.
+
+<ParamField path="body.Wx" type="matrix.Matrix" required>
+  Shared input weight `(D, 3H)`.
+</ParamField>
+
+<ParamField path="body.Wh" type="matrix.Matrix" required>
+  Shared hidden weight `(H, 3H)`.
+</ParamField>
+
+<ParamField path="body.B" type="matrix.Matrix" required>
+  Shared bias `(1, 3H)`.
+</ParamField>
+
+<ParamField path="body.Stateful" type="bool" default="false">
+  Carry the hidden state `h` across `Forward` calls when `true`.
+</ParamField>
+
+**State management**
+
+```go
+func (l *TimeGRU) SetState(h ...matrix.Matrix)
+func (l *TimeGRU) ResetState()
+func (l *TimeGRU) DH() matrix.Matrix
+```
+
+**Signatures**
+
+```go
+func (l *TimeGRU) Forward(xs, _ []matrix.Matrix, _ ...Opts) []matrix.Matrix
+func (l *TimeGRU) Backward(dhs []matrix.Matrix) []matrix.Matrix
+```
+
+```go
+l := &layer.TimeGRU{
+    Wx:       matrix.Randn(D, 3*H, nil).MulC(weight.He(D)),
+    Wh:       matrix.Randn(H, 3*H, nil).MulC(weight.He(H)),
+    B:        matrix.Zero(1, 3*H),
+    Stateful: false,
+}
+hs := l.Forward(xs, nil)
+```
+
+---
+
+## TimeBiLSTM
+
+Bidirectional LSTM: processes the sequence forward and backward with two independent `TimeLSTM` instances, then concatenates their hidden states along the feature axis. The output at each time step has shape `(N, 2H)`.
+
+<ParamField path="body.F" type="*TimeLSTM" required>
+  Forward-direction `TimeLSTM`.
+</ParamField>
+
+<ParamField path="body.B" type="*TimeLSTM" required>
+  Backward-direction `TimeLSTM`.
+</ParamField>
+
+**State management**
+
+```go
+// SetState(hf, hb) sets hidden states for both directions.
+// SetState(hf, cf, hb, cb) sets hidden and cell states for both directions.
+func (l *TimeBiLSTM) SetState(h ...matrix.Matrix)
+func (l *TimeBiLSTM) ResetState()
+```
+
+**Signatures**
+
+```go
+func (l *TimeBiLSTM) Forward(xs, _ []matrix.Matrix, _ ...Opts) []matrix.Matrix
+func (l *TimeBiLSTM) Backward(dhs []matrix.Matrix) []matrix.Matrix
+```
+
+```go
+fwd := &layer.TimeLSTM{Wx: Wxf, Wh: Whf, B: Bf}
+bwd := &layer.TimeLSTM{Wx: Wxb, Wh: Whb, B: Bb}
+l := &layer.TimeBiLSTM{F: fwd, B: bwd}
+hs := l.Forward(xs, nil) // each hs[t] shape: (N, 2H)
+```
+
+---
+
+## TimeEmbedding
+
+Applies a shared `Embedding` lookup at every time step.
+
+<ParamField path="body.W" type="matrix.Matrix" required>
+  Shared embedding weight `(V, D)`.
+</ParamField>
+
+<ParamField path="body.DW" type="matrix.Matrix">
+  Accumulated gradient for `W`.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *TimeEmbedding) Forward(xs, _ []matrix.Matrix, _ ...Opts) []matrix.Matrix
+func (l *TimeEmbedding) Backward(dout []matrix.Matrix) []matrix.Matrix
+```
+
+`xs` is a slice of `T` index matrices each of shape `(N, 1)`. Returns a slice of `T` matrices each of shape `(N, D)`.
+
+---
+
+## TimeAffine
+
+Applies a shared `Affine` transformation at every time step, accumulating gradients across the sequence.
+
+<ParamField path="body.W" type="matrix.Matrix" required>
+  Shared weight matrix `(H, C)`.
+</ParamField>
+
+<ParamField path="body.B" type="matrix.Matrix" required>
+  Shared bias `(1, C)`.
+</ParamField>
+
+<ParamField path="body.DW" type="matrix.Matrix">
+  Accumulated gradient for `W`.
+</ParamField>
+
+<ParamField path="body.DB" type="matrix.Matrix">
+  Accumulated gradient for `B`.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *TimeAffine) Forward(xs, _ []matrix.Matrix, _ ...Opts) []matrix.Matrix
+func (l *TimeAffine) Backward(dout []matrix.Matrix) []matrix.Matrix
+```
+
+---
+
+## TimeDropout
+
+Applies a single shared dropout mask across all time steps. The mask is sampled once per `Forward` call and reused at every `t`, which preserves temporal correlation in the dropped units.
+
+<ParamField path="body.Ratio" type="float64" required>
+  Drop probability. Pass `layer.Opts{Train: true}` to activate masking.
+</ParamField>
+
+**Signatures**
+
+```go
+func (l *TimeDropout) Forward(xs, _ []matrix.Matrix, opts ...Opts) []matrix.Matrix
+func (l *TimeDropout) Backward(dout []matrix.Matrix) []matrix.Matrix
+```
+
+---
+
+## TimeSoftmaxWithLoss
+
+Applies `SoftmaxWithLoss` at every time step and returns a single averaged scalar loss. Label inputs are integer class indices; the layer converts them to one-hot internally.
+
+**Signatures**
+
+```go
+func (l *TimeSoftmaxWithLoss) Forward(xs, ts []matrix.Matrix, _ ...Opts) []matrix.Matrix
+func (l *TimeSoftmaxWithLoss) Backward(dout []matrix.Matrix) []matrix.Matrix
+```
+
+`xs` — logit slice `(T, N, V)`; `ts` — target index slice `(T, N, 1)`. Returns `[]matrix.Matrix` with a single `(1, 1)` loss averaged over `T`.
+
+```go
+l := &layer.TimeSoftmaxWithLoss{}
+loss := l.Forward(xs, ts) // loss[0] is the scalar (1,1) matrix
+dxs := l.Backward([]matrix.Matrix{matrix.New([]float64{1.0})})
+```
+
+  </Tab>
+</Tabs>
+
+<Tip>
+  For encoder–decoder models, call `encoder.DH()` after the encoder backward pass and pass the result to `decoder.SetState(dh)` before the decoder forward pass to wire gradient flow between the two stacks.
+</Tip>

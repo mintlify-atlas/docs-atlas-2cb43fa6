@@ -1,0 +1,249 @@
+---
+title: "Trainer API: feedforward, RNNLM, and Seq2Seq trainers"
+description: "API reference for neu's trainer package: Trainer, RNNLMTrainer, and Seq2SeqTrainer with their Input structs, Fit methods, and helper functions Accuracy, Random, Range."
+keywords: ["trainer", "fit", "training loop", "rnnlm", "seq2seq", "accuracy", "neu", "golang"]
+---
+
+The `trainer` package provides ready-made training loops for the three major model families in neu. `Trainer` handles feedforward models, `RNNLMTrainer` handles recurrent language models, and `Seq2SeqTrainer` handles sequence-to-sequence models. Each trainer owns a model and an optimizer and exposes a single `Fit` method that runs the full training loop.
+
+---
+
+## Interfaces
+
+```go
+type Model interface {
+    Predict(x matrix.Matrix, opts ...layer.Opts) matrix.Matrix
+    Forward(x, t matrix.Matrix) matrix.Matrix
+    Backward() matrix.Matrix
+    Params() [][]matrix.Matrix
+    Grads() [][]matrix.Matrix
+    SetParams(p [][]matrix.Matrix)
+}
+
+type Optimizer interface {
+    Update(m optimizer.Model) [][]matrix.Matrix
+}
+```
+
+All four optimizer types (`SGD`, `Momentum`, `AdaGrad`, `Adam`) satisfy `Optimizer`. All feedforward model types (`Sequential`, `MLP`) satisfy `Model`.
+
+---
+
+## Trainer
+
+`Trainer` trains feedforward models by shuffling the dataset at the start of each epoch and iterating over mini-batches.
+
+```go
+type Trainer struct {
+    Model     Model
+    Optimizer Optimizer
+}
+
+func New(m Model, o Optimizer) *Trainer
+```
+
+### Input
+
+```go
+type Input struct {
+    Train      matrix.Matrix
+    TrainLabel matrix.Matrix
+    Epochs     int
+    BatchSize  int
+    Verbose    func(epoch, j int, loss float64, m Model)
+}
+```
+
+<ParamField path="body.Train" type="matrix.Matrix" required>
+  Training data matrix of shape `(N, D)` where `N` is the number of samples and `D` is the number of features.
+</ParamField>
+
+<ParamField path="body.TrainLabel" type="matrix.Matrix" required>
+  One-hot or class-index label matrix of shape `(N, C)`. Must have the same number of rows as `Train`.
+</ParamField>
+
+<ParamField path="body.Epochs" type="int" required>
+  Number of full passes over the training data.
+</ParamField>
+
+<ParamField path="body.BatchSize" type="int" required>
+  Number of samples per mini-batch. `len(Train)` must be divisible by `BatchSize` for all batches to be the same size.
+</ParamField>
+
+<ParamField path="body.Verbose" type="func(epoch, j int, loss float64, m Model)">
+  Callback invoked after each batch update with the current epoch index, batch index, scalar loss, and the model. Pass a no-op function `func(_, _ int, _ float64, _ trainer.Model) {}` to suppress all output.
+</ParamField>
+
+### Fit
+
+```go
+func (tr *Trainer) Fit(in *Input, s ...randv2.Source)
+```
+
+Shuffles `Train` and `TrainLabel` together at the start of each epoch, then iterates over non-overlapping batches. For each batch it calls `Forward`, `Backward`, and `Optimizer.Update` in sequence.
+
+```go
+tr := trainer.New(m, &optimizer.Adam{Alpha: 0.001, Beta1: 0.9, Beta2: 0.999})
+tr.Fit(&trainer.Input{
+    Train:      xTrain,
+    TrainLabel: tTrain,
+    Epochs:     20,
+    BatchSize:  100,
+    Verbose: func(epoch, j int, loss float64, _ trainer.Model) {
+        fmt.Printf("epoch=%d batch=%d loss=%.4f\n", epoch, j, loss)
+    },
+})
+```
+
+---
+
+## RNNLMTrainer
+
+`RNNLMTrainer` trains recurrent language models that work on token-ID sequences rather than floating-point feature matrices.
+
+```go
+type RNNLMTrainer struct {
+    Model     RNNLM
+    Optimizer Optimizer
+}
+
+func NewRNNLM(m RNNLM, o Optimizer) *RNNLMTrainer
+```
+
+The `RNNLM` interface is satisfied by `model.RNNLM`, `model.LSTMLM`, `model.GRULM`, and `model.RNNLMGen`.
+
+### RNNLMInput
+
+```go
+type RNNLMInput struct {
+    Train      []int
+    TrainLabel []int
+    Epochs     int
+    BatchSize  int
+    TimeSize   int
+    Verbose    func(epoch, j int, perplexity float64, m RNNLM)
+}
+```
+
+<ParamField path="body.Train" type="[]int" required>
+  Flat sequence of training token IDs. The trainer slices this into parallel streams and then into time windows.
+</ParamField>
+
+<ParamField path="body.TrainLabel" type="[]int" required>
+  Flat sequence of target token IDs, offset by one position relative to `Train` for next-token prediction.
+</ParamField>
+
+<ParamField path="body.Epochs" type="int" required>
+  Number of full passes over the corpus.
+</ParamField>
+
+<ParamField path="body.BatchSize" type="int" required>
+  Number of parallel sequences processed simultaneously. The corpus is divided into `BatchSize` contiguous streams.
+</ParamField>
+
+<ParamField path="body.TimeSize" type="int" required>
+  Number of time steps (tokens) per mini-batch. Each mini-batch is a `(TimeSize, BatchSize, 1)` tensor.
+</ParamField>
+
+<ParamField path="body.Verbose" type="func(epoch, j int, perplexity float64, m RNNLM)">
+  Callback invoked after each batch with the current epoch, batch index, running perplexity `exp(loss / count)`, and the model.
+</ParamField>
+
+### Fit
+
+```go
+func (tr *RNNLMTrainer) Fit(in *RNNLMInput)
+```
+
+Divides `Train` into `BatchSize` equally-spaced offset streams and iterates through them `TimeSize` tokens at a time. The trainer maintains a `timeIdx` cursor across batches so hidden states carry over correctly between time windows. Perplexity is accumulated within each epoch and reset at epoch boundaries.
+
+---
+
+## Seq2SeqTrainer
+
+`Seq2SeqTrainer` trains all three seq2seq model variants.
+
+```go
+type Seq2SeqTrainer struct {
+    Model     Seq2Seq
+    Optimizer Optimizer
+}
+
+func NewSeq2Seq(m Seq2Seq, o Optimizer) *Seq2SeqTrainer
+```
+
+The `Seq2Seq` interface is satisfied by `model.Seq2Seq`, `model.PeekySeq2Seq`, and `model.AttentionSeq2Seq`.
+
+### Seq2SeqInput
+
+```go
+type Seq2SeqInput struct {
+    Train      [][]int
+    TrainLabel [][]int
+    Epochs     int
+    BatchSize  int
+    Verbose    func(epoch, j int, loss float64, m Seq2Seq)
+}
+```
+
+<ParamField path="body.Train" type="[][]int" required>
+  Slice of input sequences. Each inner slice is one input example (e.g., `[5, 7, '+', '5', ' ', ' ', ' ']` as token IDs). The trainer reverses each batch along the time axis before passing it to the encoder.
+</ParamField>
+
+<ParamField path="body.TrainLabel" type="[][]int" required>
+  Slice of target sequences. Each inner slice is one target example (e.g., `['_', '6', '2', ' ']`). The trainer uses `ts[:-1]` as decoder input and `ts[1:]` as the prediction target.
+</ParamField>
+
+<ParamField path="body.Epochs" type="int" required>
+  Number of full passes over the training data.
+</ParamField>
+
+<ParamField path="body.BatchSize" type="int" required>
+  Number of sequence pairs per mini-batch.
+</ParamField>
+
+<ParamField path="body.Verbose" type="func(epoch, j int, loss float64, m Seq2Seq)">
+  Callback invoked after each batch with epoch, batch index, running average loss, and the model.
+</ParamField>
+
+### Fit
+
+```go
+func (tr *Seq2SeqTrainer) Fit(in *Seq2SeqInput, s ...randv2.Source)
+```
+
+Shuffles `Train` and `TrainLabel` together at the start of each epoch. For each batch, it reverses the input sequences along the time axis (a common trick that improves seq2seq performance), reshapes both to `(Time, N, 1)` tensors, then calls `Forward`, `Backward`, and `Optimizer.Update`.
+
+---
+
+## Helper functions
+
+### Accuracy
+
+```go
+func Accuracy(y, t matrix.Matrix) float64
+```
+
+Computes classification accuracy. Takes a predicted score matrix `y` (shape `(N, C)`) and a one-hot target matrix `t` (same shape), computes argmax for each row, and returns the fraction of rows where predictions match targets.
+
+```go
+preds := m.Predict(xTest)
+acc := trainer.Accuracy(preds, tTest)
+fmt.Printf("test accuracy: %.4f\n", acc)
+```
+
+### Random
+
+```go
+func Random(trainSize, batchSize int, s ...randv2.Source) []int
+```
+
+Returns a slice of `batchSize` unique random indices drawn without replacement from `[0, trainSize)`. Useful for constructing mini-batches when you want random sampling rather than sequential iteration.
+
+### Range
+
+```go
+func Range(i, batchSize int) (int, int)
+```
+
+Returns `begin = i * batchSize` and `end = begin + batchSize`. Used internally by `Fit` to slice sequential mini-batches after shuffling.
